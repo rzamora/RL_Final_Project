@@ -32,14 +32,18 @@ import os
 warnings.filterwarnings("ignore")
 
 from arch import arch_model
+from arch.univariate import StudentsT
 from scipy.stats import t as student_t
 from scipy.special import gammaln
 from scipy.optimize import minimize
-import yfinance as yf
+from pathlib import Path
+import warnings
+warnings.filterwarnings("ignore", message="Model is not converging")
 
 # optional HMM backend
 try:
     from hmmlearn import hmm as hmmlearn_hmm
+    from hmmlearn import _utils  # if needed
     HAS_HMMLEARN = True
 except ImportError:
     HAS_HMMLEARN = False
@@ -49,10 +53,12 @@ except ImportError:
 # =============================================================================
 # CONFIG
 # =============================================================================
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DATA_DIR = PROJECT_ROOT / "data" / "raw"
 ASSETS       = ["NVDA", "AMD", "SMH", "TLT"]
-TBILL_TICKER = "IRX"
-START        = "2015-01-01"
-END          = "2024-12-31"
+TBILL_TICKER = "DTB3"
+START        = "2004-02-07"  # TLT has the least history, this is the start date of TLT
+END          = "2022-12-31"  # set so we can test 2023, 2024, 2025 and 2026
 
 # 4-regime design:
 #   0 = Bull
@@ -66,21 +72,21 @@ np.random.seed(RANDOM_SEED)
 REGIME_NAMES = {
     0: "Bull",
     1: "Bear",
-    2: "Crisis",
-    3: "InflationShock",
+    2: "Severe Bear",
+    3: "Crisis",
 }
 REGIME_COLORS = {
     0: "#2ecc71",   # green
-    1: "#e67e22",   # orange
-    2: "#e74c3c",   # red
-    3: "#8e44ad",   # purple
+    1: "#f39c12",   # orange (mild stress)
+    2: "#e67e22",   # darker orange (severe)
+    3: "#e74c3c",   # red (acute crisis)
 }
 
 
 # =============================================================================
 # 1. DATA
 # =============================================================================
-def download_data(assets, tbill_ticker, start=None, end=None, data_dir="data/raw"):
+def download_data(assets, tbill_ticker, start=None, end=None):
     """
     Load already-downloaded RL market data from CSV files stored in the repo's
     relative data directory.
@@ -122,8 +128,8 @@ def download_data(assets, tbill_ticker, start=None, end=None, data_dir="data/raw
     """
     print("Reading files...")
 
-    if not os.path.isdir(data_dir):
-        raise FileNotFoundError(f"Data directory not found: {data_dir}")
+    if not os.path.isdir(DATA_DIR):
+        raise FileNotFoundError(f"Data directory not found: {DATA_DIR}")
 
     price_frames = []
     return_frames = []
@@ -132,7 +138,7 @@ def download_data(assets, tbill_ticker, start=None, end=None, data_dir="data/raw
     # Load risky assets
     # -------------------------
     for ticker in assets:
-        file_path = os.path.join(data_dir, f"{ticker}_StockData_RL.csv")
+        file_path = os.path.join(DATA_DIR, f"{ticker}_StockData_RL.csv")
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Missing file: {file_path}")
 
@@ -172,7 +178,7 @@ def download_data(assets, tbill_ticker, start=None, end=None, data_dir="data/raw
     # -------------------------
     # Load DTB3 / short rate
     # -------------------------
-    tbill_path = os.path.join(data_dir, f"{tbill_ticker}_StockData_RL.csv")
+    tbill_path = os.path.join(DATA_DIR, f"{tbill_ticker}_StockData_RL.csv")
     if not os.path.exists(tbill_path):
         raise FileNotFoundError(f"Missing file: {tbill_path}")
 
@@ -215,19 +221,10 @@ def download_data(assets, tbill_ticker, start=None, end=None, data_dir="data/raw
 # =============================================================================
 # 2. HELPERS
 # =============================================================================
-def classify_regime_labels(means, covars=None, assets=None):
+def classify_regime_labels(means, covars, assets):
     """
-    Map raw HMM states to semantic labels:
-        Bull, Bear, Crisis, InflationShock
-
-    Logic:
-    - Bull: highest equity mean
-    - Crisis: low equity mean + positive TLT mean + high vol proxy
-    - InflationShock: low equity mean + low/negative TLT mean
-    - Bear: remaining negative/moderate state
-
-    Returns:
-        remap: dict raw_state -> canonical_label
+    Label regimes based on what the data actually shows.
+    Priority: Bull (+drift) → Crisis (highest vol) → Bear (negative eq) → SevereBear (rest)
     """
     if assets is None:
         raise ValueError("assets must be provided")
@@ -237,44 +234,26 @@ def classify_regime_labels(means, covars=None, assets=None):
 
     scores = []
     for k in range(means.shape[0]):
-        eq_mean = float(means[k, eq_idx].mean())
-        tlt_mean = float(means[k, tlt_idx])
-        vol_proxy = float(np.trace(covars[k])) if covars is not None else 0.0
         scores.append({
             "raw": k,
-            "eq_mean": eq_mean,
-            "tlt_mean": tlt_mean,
-            "vol_proxy": vol_proxy,
+            "eq_mean": float(means[k, eq_idx].mean()),
+            "tlt_mean": float(means[k, tlt_idx]),
+            "eq_vol": float(np.sqrt(np.diag(covars[k])[eq_idx].mean())),
         })
 
-    # Bull = strongest equities
+    # Bull = highest equity mean (regardless of vol — could be high-vol AI bull)
     bull = max(scores, key=lambda d: d["eq_mean"])["raw"]
-    remaining = [d for d in scores if d["raw"] != bull]
+    remaining = [s for s in scores if s["raw"] != bull]
 
-    # Crisis = bad equities, TLT helps, high vol
-    crisis = max(
-        remaining,
-        key=lambda d: (-d["eq_mean"] + d["tlt_mean"] + 0.10 * d["vol_proxy"])
-    )["raw"]
-    remaining = [d for d in remaining if d["raw"] != crisis]
+    # Crisis = highest equity vol among non-Bull regimes
+    crisis = max(remaining, key=lambda d: d["eq_vol"])["raw"]
+    remaining = [s for s in remaining if s["raw"] != crisis]
 
-    # Inflation shock = both equities and TLT weak
-    inflation = min(
-        remaining,
-        key=lambda d: (d["eq_mean"] + d["tlt_mean"])
-    )["raw"]
-    remaining = [d for d in remaining if d["raw"] != inflation]
+    # SevereBear = next-highest vol with negative equity mean
+    severe = max(remaining, key=lambda d: d["eq_vol"] - d["eq_mean"])["raw"]
+    bear = [s for s in remaining if s["raw"] != severe][0]["raw"]
 
-    # Whatever is left = Bear
-    bear = remaining[0]["raw"]
-
-    return {
-        bull: 0,
-        bear: 1,
-        crisis: 2,
-        inflation: 3,
-    }
-
+    return {bull: 0, bear: 1, severe: 2, crisis: 3}
 
 def regime_summary_table(regime_seq, returns):
     """
@@ -309,6 +288,20 @@ def regime_summary_table(regime_seq, returns):
     return pd.DataFrame(rows)
 
 
+def make_regime_features(returns, window=21):
+    """Rolling features that describe regime state."""
+    eq = returns[["NVDA", "AMD", "SMH"]].mean(axis=1)
+    tlt = returns["TLT"]
+
+    feats = pd.DataFrame(index=returns.index)
+    feats["eq_mean"]     = eq.rolling(window).mean()
+    feats["eq_vol"]      = eq.rolling(window).std()
+    feats["tlt_mean"]    = tlt.rolling(window).mean()
+    feats["tlt_vol"]     = tlt.rolling(window).std()
+    feats["eq_tlt_corr"] = eq.rolling(window).corr(tlt)
+    feats["downside"]    = eq.clip(upper=0).rolling(window).mean()
+    return feats
+
 def build_synthetic_prices(sim_returns, start_price=100.0):
     """
     Convert simulated returns (%) into normalized price paths.
@@ -333,23 +326,40 @@ def build_synthetic_prices(sim_returns, start_price=100.0):
         prices[:, t + 1, :] = prices[:, t, :] * (1.0 + ret[:, t, :])
     return prices
 
+def standardized_t_cdf(z, nu):
+    """CDF of standardized Student-t (var=1) at z."""
+    scale = np.sqrt(nu / (nu - 2))
+    return student_t.cdf(z * scale, df=nu)
+
+def standardized_t_ppf(u, nu):
+    """Inverse CDF of standardized Student-t."""
+    scale = np.sqrt(nu / (nu - 2))
+    return student_t.ppf(u, df=nu) / scale
+
+
+def regime_count(start, end, label):
+    dates = returns.index[regime_seq == label]
+    return sum(start <= d.strftime('%Y-%m-%d') <= end for d in dates)
+
 
 # =============================================================================
 # 3. REGIME CLASSIFICATION VIA HMM
 # =============================================================================
-def fit_hmm_regimes(returns, n_regimes=N_REGIMES):
+def fit_hmm_regimes(returns, n_regimes=N_REGIMES, feature_window=21):
     """
-    Fit a Gaussian HMM on the return matrix.
+    Fit a Gaussian HMM on rolling regime features.
+    Returns sequences aligned to the original `returns` index (length T).
+    """
+    print(f"\nFitting {n_regimes}-state HMM on rolling features...")
+    T_full = len(returns)
 
-    Returns:
-        regime_seq   : (T,) canonical regime labels
-        regime_probs : (T, K) state probabilities reordered to canonical labels
-        hmm_model    : fitted model object
-        trans_sorted : transition matrix in canonical order
-    """
-    print(f"\nFitting {n_regimes}-state HMM...")
-    X = returns.values
-    T, N = X.shape
+    # Build features and drop initial NaN rows
+    feats_full = make_regime_features(returns, window=feature_window)
+    feats = feats_full.dropna()
+    n_drop = T_full - len(feats)
+    X = feats.values
+    T_fit, _ = X.shape
+    N = returns.shape[1]
 
     if HAS_HMMLEARN:
         model = hmmlearn_hmm.GaussianHMM(
@@ -357,50 +367,69 @@ def fit_hmm_regimes(returns, n_regimes=N_REGIMES):
             covariance_type="full",
             n_iter=200,
             random_state=RANDOM_SEED,
-            tol=1e-5
+            tol=1e-5,
         )
         model.fit(X)
-        raw_seq = model.predict(X)
-        raw_probs = model.predict_proba(X)
-        means = model.means_
-        covars = model.covars_ if hasattr(model, "covars_") else None
+        raw_seq_short = model.predict(X)
+        raw_probs_short = model.predict_proba(X)
         trans_mat = model.transmat_
-    else:
-        # fallback clustering on rolling mean/vol features
-        from sklearn.mixture import GaussianMixture
-        roll_mean = pd.DataFrame(X).rolling(21).mean().dropna().values
-        roll_vol  = pd.DataFrame(X).rolling(21).std().dropna().values
-        features  = np.hstack([roll_mean, roll_vol])
 
-        gm = GaussianMixture(n_components=n_regimes, random_state=RANDOM_SEED, n_init=5)
-        gm.fit(features)
-        labels = np.full(T, 0)
-        labels[20:] = gm.predict(features)
-        labels[:20] = labels[20]
-        raw_seq = labels
-        raw_probs = np.zeros((T, n_regimes))
-        raw_probs[np.arange(T), raw_seq] = 1.0
-        means = np.array([X[raw_seq == k].mean(axis=0) for k in range(n_regimes)])
+        # Compute means/covars on RETURNS (not features) for labeling
+        ret_arr = returns.values
+        # raw_seq_short corresponds to returns rows [n_drop:]
+        means = np.array([
+            ret_arr[n_drop:][raw_seq_short == k].mean(axis=0)
+            if (raw_seq_short == k).sum() > 0 else np.zeros(N)
+            for k in range(n_regimes)
+        ])
         covars = np.array([
-            np.cov(X[raw_seq == k].T) if (raw_seq == k).sum() > 1 else np.eye(N)
+            np.cov(ret_arr[n_drop:][raw_seq_short == k].T)
+            if (raw_seq_short == k).sum() > 1 else np.eye(N)
+            for k in range(n_regimes)
+        ])
+    else:
+        from sklearn.mixture import GaussianMixture
+        gm = GaussianMixture(n_components=n_regimes, random_state=RANDOM_SEED, n_init=5)
+        gm.fit(X)
+        raw_seq_short = gm.predict(X)
+        raw_probs_short = gm.predict_proba(X)
+
+        ret_arr = returns.values
+        means = np.array([
+            ret_arr[n_drop:][raw_seq_short == k].mean(axis=0)
+            if (raw_seq_short == k).sum() > 0 else np.zeros(N)
+            for k in range(n_regimes)
+        ])
+        covars = np.array([
+            np.cov(ret_arr[n_drop:][raw_seq_short == k].T)
+            if (raw_seq_short == k).sum() > 1 else np.eye(N)
             for k in range(n_regimes)
         ])
         trans_mat = np.zeros((n_regimes, n_regimes))
-        for t in range(T - 1):
-            trans_mat[raw_seq[t], raw_seq[t + 1]] += 1.0
-        trans_row_sums = trans_mat.sum(axis=1, keepdims=True)
-        trans_mat = np.divide(trans_mat, np.where(trans_row_sums == 0, 1, trans_row_sums))
+        for t in range(T_fit - 1):
+            trans_mat[raw_seq_short[t], raw_seq_short[t + 1]] += 1.0
+        row_sums = trans_mat.sum(axis=1, keepdims=True)
+        trans_mat = np.divide(trans_mat, np.where(row_sums == 0, 1, row_sums))
         model = gm
 
+    # Map raw HMM labels → canonical {0:Bull, 1:Bear, 2:Crisis, 3:InflationShock}
     remap = classify_regime_labels(means=means, covars=covars, assets=list(returns.columns))
-    # inverse ordering: canonical label -> raw label
     order = [raw for raw, canon in sorted(remap.items(), key=lambda kv: kv[1])]
 
-    regime_seq = np.array([remap[r] for r in raw_seq], dtype=int)
-    regime_probs = raw_probs[:, order]
+    canon_seq_short = np.array([remap[r] for r in raw_seq_short], dtype=int)
+    canon_probs_short = raw_probs_short[:, order]
     trans_sorted = trans_mat[np.ix_(order, order)]
 
-    # print regime stats
+    # Pad first n_drop rows: assign them to the same regime as the first valid day
+    regime_seq = np.empty(T_full, dtype=int)
+    regime_seq[n_drop:] = canon_seq_short
+    regime_seq[:n_drop] = canon_seq_short[0]
+
+    regime_probs = np.zeros((T_full, n_regimes))
+    regime_probs[n_drop:] = canon_probs_short
+    regime_probs[:n_drop] = canon_probs_short[0]   # broadcast first valid row
+
+    # Diagnostics
     print("\nRegime diagnostics:")
     for k in range(n_regimes):
         mask = regime_seq == k
@@ -409,12 +438,11 @@ def fit_hmm_regimes(returns, n_regimes=N_REGIMES):
             print(f"  Regime {k} ({REGIME_NAMES[k]}): 0 observations")
             continue
         sub = returns.loc[mask]
-        avg_r = sub.mean(axis=0).values
         avg_v = sub.std(axis=0).values
         eq_mean = sub[["NVDA", "AMD", "SMH"]].mean().mean()
         tlt_mean = sub["TLT"].mean()
         print(
-            f"  Regime {k} ({REGIME_NAMES[k]:14s}): {cnt:4d} days ({cnt/T*100:5.1f}%) | "
+            f"  Regime {k} ({REGIME_NAMES[k]:14s}): {cnt:4d} days ({cnt/T_full*100:5.1f}%) | "
             f"eq_mean={eq_mean: .3f} | tlt_mean={tlt_mean: .3f} | "
             f"vol=[{', '.join(f'{v:.2f}' for v in avg_v)}]"
         )
@@ -433,10 +461,24 @@ def fit_hmm_regimes(returns, n_regimes=N_REGIMES):
 # =============================================================================
 # 4. PER-REGIME GARCH + DCC + COPULA
 # =============================================================================
-def fit_garch_single(series, asset_name):
-    model = arch_model(series, vol="Garch", p=1, q=1, dist="StudentsT", mean="Constant")
-    result = model.fit(disp="off", show_warning=False)
-    return result
+def fit_constant_t(series):
+    """Constant variance + Student-t innovations for small-sample regimes."""
+    model = arch_model(series, vol="Constant", dist="StudentsT", mean="Constant")
+    return model.fit(disp="off", show_warning=False)
+
+def fit_garch_single(series, asset_name, min_obs_for_garch=1000):
+    """
+    Fit GARCH(1,1) with Student-t innovations.
+    For small samples, fall back to constant-variance to avoid
+    pathological parameter estimates from non-contiguous regime data.
+    """
+    if len(series) < min_obs_for_garch:
+        # Constant variance + Student-t — GARCH dynamics not identifiable
+        # on small disjoint samples
+        model = arch_model(series, vol="Constant", dist="StudentsT", mean="Constant")
+    else:
+        model = arch_model(series, vol="Garch", p=1, q=1, dist="StudentsT", mean="Constant")
+    return model.fit(disp="off", show_warning=False)
 
 
 def fit_dcc_single(std_resids):
@@ -488,51 +530,47 @@ def fit_dcc_single(std_resids):
 
 
 def fit_t_copula_single(U):
-    """
-    Fit Student-t copula df parameter and correlation matrix.
-    """
     N = U.shape[1]
+    U_clip = np.clip(U.values, 1e-6, 1 - 1e-6)
 
     def neg_ll(nu_arr):
         nu = nu_arr[0]
         if nu <= 2:
             return 1e10
-
-        X = student_t.ppf(np.clip(U.values, 1e-6, 1 - 1e-6), df=nu)
+        X = student_t.ppf(U_clip, df=nu)
         R = np.corrcoef(X.T) + np.eye(N) * 1e-6
         sign, ldet = np.linalg.slogdet(R)
         if sign <= 0:
             return 1e10
         Ri = np.linalg.inv(R)
-        T_ = U.shape[0]
-        ll = 0.0
-        for i in range(T_):
-            xi = X[i]
-            quad = float(xi @ Ri @ xi)
-            ll += (
+        T_ = U_clip.shape[0]
+
+        # Joint log density (vectorized)
+        quad = np.einsum('ti,ij,tj->t', X, Ri, X)
+        log_joint = (
                 gammaln((nu + N) / 2)
                 - gammaln(nu / 2)
                 - (N / 2) * np.log(nu * np.pi)
                 - 0.5 * ldet
-                - ((nu + N) / 2) * np.log(1 + quad / nu)
-                - sum([
-                    -(
-                        gammaln((nu + 1) / 2)
-                        - gammaln(nu / 2)
-                        - 0.5 * np.log(nu * np.pi)
-                        - ((nu + 1) / 2) * np.log(1 + xi[j] ** 2 / nu)
-                    ) for j in range(N)
-                ])
-            )
-        return -ll
+                - ((nu + N) / 2) * np.log1p(quad / nu)
+        )
 
-    res = minimize(neg_ll, [6.0], method="L-BFGS-B", bounds=[(2.1, 50)])
+        # Marginal log densities (sum across assets)
+        log_marg = (
+                gammaln((nu + 1) / 2)
+                - gammaln(nu / 2)
+                - 0.5 * np.log(nu * np.pi)
+                - ((nu + 1) / 2) * np.log1p(X ** 2 / nu)
+        ).sum(axis=1)
+
+        return -(log_joint - log_marg).sum()
+
+    res = minimize(neg_ll, [6.0], method="L-BFGS-B", bounds=[(2.1, 100)])
     nu = float(res.x[0])
-    X = student_t.ppf(np.clip(U.values, 1e-6, 1 - 1e-6), df=nu)
+    X = student_t.ppf(U_clip, df=nu)
     R = np.corrcoef(X.T)
     np.fill_diagonal(R, 1.0)
     return nu, R
-
 
 def fit_per_regime(returns, regime_seq, n_regimes, assets, min_obs=60):
     """
@@ -567,19 +605,37 @@ def fit_per_regime(returns, regime_seq, n_regimes, assets, min_obs=60):
             garch_k[asset] = g
             std_res_k[asset] = g.std_resid.values
             cond_vol_k[asset] = g.conditional_volatility.values
-            print(
-                f"    {asset}: ω={g.params['omega']:.4f} "
-                f"α={g.params['alpha[1]']:.4f} "
-                f"β={g.params['beta[1]']:.4f} "
-                f"ν={g.params['nu']:.2f}"
-            )
 
-        dcc_params_k, R_series_k, Q_bar_k = fit_dcc_single(std_res_k)
-        avg_R_k = np.mean(np.stack(R_series_k), axis=0)
-        print(f"    DCC: a={dcc_params_k[0]:.4f} b={dcc_params_k[1]:.4f}")
+            p = g.params
+            if "omega" in p.index and "alpha[1]" in p.index:
+                print(
+                    f"    {asset}: ω={p['omega']:.4f} "
+                    f"α={p['alpha[1]']:.4f} "
+                    f"β={p['beta[1]']:.4f} "
+                    f"ν={p['nu']:.2f}"
+                )
+            else:
+                # Constant variance fallback
+                sigma = float(g.conditional_volatility.iloc[-1])
+                print(f"    {asset}: σ={sigma:.4f} (constant) ν={p['nu']:.2f}")
 
+        has_garch_dynamics = all("omega" in garch_k[asset].params.index for asset in assets)
+
+        if has_garch_dynamics and obs >= 400:
+            dcc_params_k, R_series_k, Q_bar_k = fit_dcc_single(std_res_k)
+            avg_R_k = np.mean(np.stack(R_series_k), axis=0)
+            print(f"    DCC: a={dcc_params_k[0]:.4f} b={dcc_params_k[1]:.4f}")
+        else:
+            # Use static correlation for sparse/constant regimes
+            Q_bar_k = np.cov(std_res_k.values.T)
+            R_series_k = [np.corrcoef(std_res_k.values.T)]
+            avg_R_k = R_series_k[0]
+            dcc_params_k = (0.0, 0.0)
+            print(f"    DCC: skipped (constant variance regime, using static correlation)")
+
+        # Then in fit_per_regime:
         U_k = pd.DataFrame({
-            asset: student_t.cdf(std_res_k[asset].values, df=garch_k[asset].params["nu"])
+            asset: standardized_t_cdf(std_res_k[asset].values, nu=garch_k[asset].params["nu"])
             for asset in assets
         })
         nu_cop_k, R_cop_k = fit_t_copula_single(U_k)
@@ -609,10 +665,16 @@ def fit_per_regime(returns, regime_seq, n_regimes, assets, min_obs=60):
         })
 
     # fill sparse regimes using the Bear model if available, else Bull
-    fill_model = regime_models[1] if len(regime_models) > 1 and regime_models[1] is not None else regime_models[0]
+    fill_model = next((m for m in regime_models if m is not None), None)
+    if fill_model is None:
+        raise RuntimeError("No regime had enough observations.")
+
     for i in range(len(regime_models)):
         if regime_models[i] is None:
-            regime_models[i] = fill_model
+            copy = dict(fill_model)
+            copy["name"] = REGIME_NAMES[i] + f" (filled from {fill_model['name']})"
+            regime_models[i] = copy
+            print(f"  WARNING: Regime {i} ({REGIME_NAMES[i]}) filled from {fill_model['name']}")
 
     return regime_models
 
@@ -671,7 +733,7 @@ def simulate_hybrid_paths(
 
             # t-copula draw
             nu_c = rm["nu_copula"]
-            R_c = rm["R_copula"] + np.eye(N) * 1e-8
+            R_c = rm["avg_R"] + np.eye(N) * 1e-8
             L = np.linalg.cholesky(R_c)
             z_n = L @ np.random.randn(N)
             chi2 = np.random.chisquare(nu_c) / nu_c
@@ -683,17 +745,23 @@ def simulate_hybrid_paths(
                 p = rm["garch"][asset].params
                 mu = float(p["mu"])
                 nu_g = float(p["nu"])
-                innov = float(student_t.ppf(np.clip(U_t[i], 1e-6, 1 - 1e-6), df=nu_g))
-                sig = np.sqrt(max(h[i], 1e-8))
-                ret[i] = mu + sig * innov
+                innov = float(standardized_t_ppf(np.clip(U_t[i], 1e-6, 1 - 1e-6), nu=nu_g))
 
-                # GARCH update
-                h[i] = (
-                    float(p["omega"])
-                    + float(p["alpha[1]"]) * (ret[i] - mu) ** 2
-                    + float(p["beta[1]"]) * h[i]
-                )
-                h[i] = max(h[i], 1e-8)
+                if "omega" in p.index:
+                    # GARCH dynamics
+                    sig = np.sqrt(max(h[i], 1e-8))
+                    ret[i] = mu + sig * innov
+                    h[i] = (
+                            float(p["omega"])
+                            + float(p["alpha[1]"]) * (ret[i] - mu) ** 2
+                            + float(p["beta[1]"]) * h[i]
+                    )
+                    h[i] = max(h[i], 1e-8)
+                else:
+                    # Constant variance — use stored last conditional vol
+                    sigma_const = float(rm["garch"][asset].conditional_volatility.iloc[-1])
+                    ret[i] = mu + sigma_const * innov
+                    # h doesn't update; leave it at last_h value
 
             all_returns[path, t, :] = ret
 
@@ -975,9 +1043,51 @@ def print_regime_summary(regime_models, trans_mat):
 # 8. MAIN
 # =============================================================================
 def main():
+
+    def rcount(start, end, label):
+        dates = returns.index[regime_seq == label]
+        return sum(start <= d.strftime('%Y-%m-%d') <= end for d in dates)
+
     prices, returns, tbill_daily = download_data(ASSETS, TBILL_TICKER, START, END)
+    print(f"[line X] returns NaN={returns.isna().sum().sum()}, "
+          f"shape={returns.shape}, dtype={returns.dtypes.unique()}")
+    if not np.isfinite(returns).all().all():
+        bad_mask = ~np.isfinite(returns)
+        bad_rows = returns[bad_mask.any(axis=1)]  # rows with ≥1 non-finite value
+        print(f"Found {bad_mask.sum().sum()} non-finite values in {len(bad_rows)} row(s):")
+        print(bad_rows)
+        exit()
 
     regime_seq, regime_probs, hmm_model, trans_mat = fit_hmm_regimes(returns, N_REGIMES)
+    # Sanity: Crisis should fire during 2008-Q4 and 2020-Q1
+    crisis_dates = returns.index[regime_seq == 2]
+    print(f"\nCrisis days in 2008-Q4: {sum(('2008-10-01' <= d.strftime('%Y-%m-%d') <= '2008-12-31') for d in crisis_dates)}")
+    print(f"Crisis days in 2020-Mar: {sum(('2020-03-01' <= d.strftime('%Y-%m-%d') <= '2020-04-15') for d in crisis_dates)}")
+
+    print("Crisis regime — actual inflation episodes:")
+    print(f"  2021-Q4 (CPI rising):        {rcount('2021-10-01', '2021-12-31', 3)} days")
+    print(f"  2022-Q1 (war + inflation):   {rcount('2022-01-01', '2022-03-31', 3)} days")
+    print(f"  2022-full year:              {rcount('2022-01-01', '2022-12-31', 3)} days")
+
+    print("\nCrisis regime — non-inflation selloffs:")
+    print(f"  2015-08 (China devaluation): {rcount('2015-08-01', '2015-09-30', 3)} days")
+    print(f"  2018-Q4 (Fed selloff):       {rcount('2018-10-01', '2018-12-31', 3)} days")
+    print(f"  2008-09 to 2009-06 (GFC):    {rcount('2008-09-01', '2009-06-30', 3)} days")
+    print(f"  2020-02 to 2020-04 (COVID):  {rcount('2020-02-15', '2020-04-30', 3)} days")
+    print(f"  2011-08 (US debt ceiling):   {rcount('2011-08-01', '2011-08-31', 3)} days")
+    print(f"  2018-12 (Q4 selloff):        {rcount('2018-10-01', '2018-12-31', 3)} days")
+
+    print("Severe Bear dates check:")
+    print(f"  2008-09 to 2009-06 (GFC):       {rcount('2008-09-01', '2009-06-30', 2)} days")
+    print(f"  2020-02 to 2020-04 (COVID):     {rcount('2020-02-15', '2020-04-30', 2)} days")
+    print(f"  2011-08 (US debt ceiling):      {rcount('2011-08-01', '2011-08-31', 2)} days")
+    print(f"  2018-12 (Q4 selloff):           {rcount('2018-10-01', '2018-12-31', 2)} days")
+
+    print("\nBull dates check:")
+    print(f"  2017 (low-vol bull year):       {rcount('2017-01-01', '2017-12-31', 0)} days")
+    print(f"  2013 (taper tantrum aside):     {rcount('2013-01-01', '2013-12-31', 0)} days")
+
+
     print("\nRegime summary table:")
     print(regime_summary_table(regime_seq, returns).round(4).to_string(index=False))
 
