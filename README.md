@@ -374,6 +374,78 @@ The synthetic data generator delivers:
 
 This output is sufficient for the RL training pipeline. The next stages of the project — wavelet feature engineering, Kronos forecast integration, and the hierarchical RL environment — build on top of this synthetic data foundation.
 
+### Kronos Regime Distribution Analysis
+
+#### Overall Assessment ✅
+
+**No bucket starvation.** Smallest bucket is **4.3%** (NVDA bucket 7) — well above the 1% concern threshold. Every regime fires often enough for the RL agent to learn meaningful policy responses to it.
+
+Dominant patterns make economic sense across all four assets:
+
+| Bucket | Description | Where it's prevalent |
+|--------|-------------|----------------------|
+| 2 (low_err + high_conf) | Best forecasts | Dominant in NVDA/AMD/SMH (24-28%) |
+| 6 (high_err + low_conf) | Honestly poor forecasts | High in TLT (19.8%), AMD (16.4%) |
+| 8 (high_err + high_conf) | Overconfident | Notably high in TLT (19.1%), AMD (12.7%) |
+
+The fact that **bucket 2 is the largest bucket for the equities** says Kronos is reliably forecasting NVDA/AMD/SMH most of the time. Forecasts are accurate AND the model knows it.
+
+#### The TLT Pattern Is the Interesting Story
+
+TLT shows a strikingly different distribution from the equities:
+
+| Asset | Bucket 2 (best) | Bucket 6 (honestly bad) | Bucket 8 (overconfident) |
+|-------|-----------------|--------------------------|---------------------------|
+| NVDA  | 24.7%           | 10.9%                    | 7.5%                      |
+| AMD   | 24.3%           | 16.4%                    | 12.7%                     |
+| SMH   | **27.5%**       | 8.7%                     | 9.4%                      |
+| TLT   | 12.4%           | **19.8%**                | **19.1%**                 |
+
+For TLT, the **"bad forecast" buckets (6 + 8) sum to 38.9%**, while for SMH they only sum to 18.1%. That's a 2× higher rate of poor Kronos performance on TLT vs. semiconductors.
+
+This is consistent with the bucket-8 dates analysis done earlier. TLT had massive bucket-8 concentrations during 2007-2013 (post-GFC QE era) and 2020-2024 (post-COVID + inflation). **Kronos genuinely struggles with TLT** because central bank actions periodically restructure the bond market in ways pure technical analysis can't anticipate.
+
+The agent learning policy on this data will discover: *"Kronos forecasts for TLT are less reliable than for equities — discount them more, rely more on the regime classifier."* That's exactly the right behavior.
+
+#### Equities Differ in a Meaningful Way Too
+
+Compare AMD vs. NVDA bucket 8 specifically:
+
+| Asset | Bucket 8 (overconfident) | What this likely means |
+|-------|---------------------------|--------------------------|
+| NVDA  | 7.5%                      | Kronos rarely overconfident — appropriate humility |
+| AMD   | 12.7%                     | Frequent overconfidence |
+| SMH   | 9.4%                      | Mid-range |
+
+AMD's higher bucket-8 fraction reflects the date-level analysis: AMD has a long history of idiosyncratic events (CEO changes, near-bankruptcies, fab spinoffs) that Kronos couldn't anticipate from technical patterns. The forecaster's confidence is poorly calibrated on AMD.
+
+This is also why AMD bucket 0 is so much smaller (10.3%) than NVDA's (23.5%) — AMD has fewer "low error AND low confidence" days because Kronos is rarely cautious about AMD predictions, even when it should be.
+
+#### What This Means for the RL Agent
+
+Different regime distributions across assets means the agent will learn **asset-specific policies for using Kronos features**:
+
+- **NVDA**: Trust Kronos when bucket 2 fires (high frequency, well-calibrated)
+- **SMH**: Similar to NVDA, trust forecasts
+- **AMD**: Use Kronos forecasts cautiously — discount them when bucket 8 fires
+- **TLT**: Heavy skepticism toward Kronos — bucket 6/8 dominate, lean on regime probabilities and historical hedging behavior instead
+
+The RL state vector will have separate one-hot regime columns per asset (`NVDA_kronos_regime_0` ... `NVDA_kronos_regime_8`, `AMD_kronos_regime_0` ... etc.), so the agent has **36 binary indicators just for Kronos quality** across the 4 assets. That's enough granularity to learn these asset-specific calibration patterns.
+
+#### One Subtle Observation Worth Noting
+
+The middle bucket (bucket 4 = mid_err + mid_conf) sits at 6-9% across all assets. That's healthier than initially expected. With expanding quantiles the middle bucket *could* have been very small (since the cross-product of "exactly middle on both axes" is statistically rare), but the observed populations are reasonable.
+
+#### Bottom Line
+
+These distributions are high-quality.
+
+1. ✅ All buckets populated >4%, no starved categories
+2. ✅ Dominant buckets are economically meaningful (2, 6, 8 — the three "extreme" combinations)
+3. ✅ Asset-level differences match what you'd expect from real market dynamics
+4. ✅ TLT vs. equity asymmetry confirms Kronos struggles more with bonds (correct empirical finding)
+
+
 
 
 
