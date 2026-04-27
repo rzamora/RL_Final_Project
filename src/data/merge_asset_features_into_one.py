@@ -66,7 +66,7 @@ def merge_asset_features(
     merged : pd.DataFrame
     """
     if verbose:
-        print(f"\nMerging {len(asset_tickers)} per-asset DFs + 1 cross-asset DF "
+        print(f"\nMerging {len(asset_tickers)} per-asset DFs + 2 cross-asset DF "
               f"('{cross_asset_ticker}')")
 
     # Validation: all required keys present
@@ -122,6 +122,7 @@ def merge_asset_features(
             print(f"  [{ticker}] added {len(prefixed_cols)} prefixed columns")
 
     # Step 2: Add cross-asset block (NO prefix)
+    #for ticker in cross_asset_ticker:
     cor_df = data[cross_asset_ticker].copy()
     cor_df[date_col] = pd.to_datetime(cor_df[date_col])
 

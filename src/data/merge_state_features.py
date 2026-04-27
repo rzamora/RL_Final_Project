@@ -18,6 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "proccessed" / "individual_securities"
 DATA_MERGED = PROJECT_ROOT / "data" / "proccessed" / "combined_w_cross_asset"
 DATA_DIR_OUT = PROJECT_ROOT / "data" / "proccessed" / "individual_securities/all"
+DATA_SYN_MOD = PROJECT_ROOT / "data" / "synthetic" / "models"
 DATA_TRAIN = DATA_DIR / "train_real"
 DATA_TRAIN_PCK = DATA_TRAIN / "picke"
 DATA_ALL_PCK = DATA_DIR / "picke"
@@ -250,7 +251,9 @@ def main():
     data = dropDataAboveBelowDate(data, dropD=date(year=2026, month=4, day=23), above=True)
     getFirstLastDate(data)
 
-
+    # =============================================================================
+    # CORRELATIONS
+    # =============================================================================
 
     correlations = add_correlation_features(
         data,
@@ -292,7 +295,7 @@ def main():
     print(f"Clean window: {clean_start_date.date()} → {clean_end_date.date()} "
           f"({last_clean - first_clean + 1} rows)")
 
-    # Step 4: Trim all assets
+    # Step 4: Trim all assets + Regime
     for ticker in data.keys():
         data[ticker] = data[ticker].iloc[first_clean:last_clean + 1].reset_index(drop=True)
 
@@ -311,6 +314,19 @@ def main():
     )
 
     train = dropDataAboveBelowDate(deepcopy(merged), dropD=date(year=2022, month=12, day=31), above=True)
+    # =============================================================================
+    # REGIME PROBABILITIES
+    # =============================================================================
+    regime_df = pd.read_csv(DATA_SYN_MOD / 'regime_labels.csv', parse_dates=['date'])
+    regime_df .drop(['regime_seq'], axis=1, inplace=True)
+    train.reset_index(inplace=True)
+    common_dates = set.intersection(*[set(df['date']) for df in [train, regime_df]])
+    regime_df= regime_df[regime_df['date'].isin(common_dates)].sort_values('date').reset_index(drop=True)
+    print(f'Length of regime_df is {len(regime_df)} with lenght of train {len(train)}')
+    reg_cols = [c for c in regime_df.columns if c != 'date']
+    train = train.merge(regime_df[['date'] + reg_cols], on='date', how='left')
+    train.set_index('date', inplace=True)
+
     test = dropDataAboveBelowDate(deepcopy(merged), dropD=date(year=2022, month=12, day=31), above=False)
     # Step 5: Save
     merged.to_csv(DATA_MERGED / 'RL_Final_Merged_All.csv', index=True)
