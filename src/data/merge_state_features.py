@@ -11,6 +11,7 @@ import sys
 from datetime import datetime, date, time
 from cross_asset_correlations import add_correlation_features, diagnose_correlation_features
 from merge_asset_features_into_one import merge_asset_features
+from regime_dcc_garch_copula_V1 import make_regime_features
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -240,7 +241,76 @@ def mergeColumns(data, dfAdd, tickerAdd):
     else:
         print('\nDROP:Error variable data must be a dictionary of ticker:dataframe', type(data))
     return data
+# =============================================================================
+# 10. PREDICT REGIME PROBs for TEST SET
+# =============================================================================
 
+def predict_test_regime_probs(test, train):
+    '''
+    This function predicts the regime probabilities for the test set using the fitted HMM.
+    '''
+
+    aux_df = deepcopy(test)
+    # Load fitted HMM
+    with open(DATA_SYN_MOD /'hmm_4regime.pkl', 'rb') as f:
+        saved = pickle.load(f)
+    model = saved['hmm']
+    feature_window = saved['feature_window']
+    label_map = saved['regime_label_map']
+
+    warmup = train.iloc[-feature_window:]  # last 21 trading days of train
+    returnCols = [c for c in warmup.columns if c.endswith('_CPct_Chg1')]
+    warmup = warmup[returnCols]
+    warmup.columns = [c.split('_')[0] for c in warmup.columns]
+
+    # Load test data — must have the same return columns as training data
+    # test_returns = pd.read_csv('data/test_returns.csv', parse_dates=['date'], index_col='date')
+    returnCols = [c for c in aux_df.columns if c.endswith('_CPct_Chg1')]
+    aux_df = aux_df[returnCols]
+    aux_df.columns = [c.split('_')[0] for c in aux_df.columns]
+
+    # Compute the SAME rolling features used during training
+    combined = pd.concat([warmup, aux_df])
+    combined_features = make_regime_features(combined, window=feature_window)
+    test_features = combined_features.iloc[feature_window:]  # drop the warmup rows
+    print(f"sum first 3 rows if isna :{test_features.head(3).isna().sum()} all zeroes expected")
+    print(f"Length: {len(test_features)} (should equal len(test) = {len(test)})")
+
+    # Drop any rows where features are NaN (the warmup window)
+    valid_mask = test_features.notna().all(axis=1)
+    test_features_valid = test_features[valid_mask].values
+    print(f'Number of valid test features: {len(test_features_valid)} vs {len(test_features)}')
+
+    # Predict regime probabilities on test data this is online
+    probs_online = []
+    for t in range(len(test_features_valid)):
+        history = test_features_valid[:t+1]
+        probs_history = model.predict_proba(history)
+        probs_online.append(probs_history[-1]) #last row only
+    probs_online = np.array(probs_online)
+
+    if len(probs_online) != len(test):
+        print(f"ERROR: probs_online length {len(probs_online)} does not equal len(test) {len(test)}")
+        print(f"Cannot save probs_online because it is not the same length as test")
+    else:
+        prob_columns = ['regime_prob_Bull', 'regime_prob_Bear', 'regime_prob_SevereBear', 'regime_prob_Crisis']
+        test_regime_probs = probs_online
+        test[prob_columns] = test_regime_probs
+
+    # Step 2: Compute hard labels from the reordered probs (or via label_map applied to raw seq — same result)
+    test_regime_seq = np.argmax(test_regime_probs, axis=1)
+    regime_names = ['Bull', 'Bear', 'SevereBear', 'Crisis']
+    unique, counts = np.unique(test_regime_seq, return_counts=True)
+    total = counts.sum()
+    print("Test regime distribution:")
+    for u, c in zip(unique, counts):
+        print(f"  {regime_names[u]}: {c / total:.3f}")
+
+    print("Saving the test file with regime probabilities...")
+    test.to_csv(DATA_MERGED / 'test' / 'RL_Final_Merged_test.csv', index=True)
+    return test_regime_seq
+
+    # This reorders columns so column 0 = Bull, column 1 = Bear, etc.
 # =============================================================================
 # 10. MAIN
 # =============================================================================
@@ -331,7 +401,8 @@ def main():
     # Step 5: Save
     merged.to_csv(DATA_MERGED / 'RL_Final_Merged_All.csv', index=True)
     train.to_csv(DATA_MERGED / 'train' / 'RL_Final_Merged_train.csv', index=True)
-    test.to_csv(DATA_MERGED / 'test' / 'RL_Final_Merged_test.csv', index=True)
+    predict_test_regime_probs(test, train)  # will also save it to DATA_MERGED / 'test' / 'RL_Final_Merged_test.csv'
+
 
 
 if __name__ == "__main__":
