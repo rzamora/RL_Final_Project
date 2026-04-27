@@ -3,8 +3,9 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from stable_baselines3 import PPO
+from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.env_checker import check_env
-
+from torch import nn
 
 # ============================================================
 # Shared portfolio simulator
@@ -267,6 +268,51 @@ class HighLevelPortfolioEnv(gym.Env):
         return self.core.obs(), reward, done, False, info
 
 
+class LayerNormMlpExtractor(nn.Module):
+    def __init__(self, features_dim=299):
+        super().__init__()
+        self.policy_net = nn.Sequential(
+            nn.Linear(features_dim, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+        )
+        
+        self.value_net = nn.Sequential(
+            nn.Linear(features_dim, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+        )
+        
+        self.latent_dim_pi = 256
+        self.latent_dim_vf = 256
+    
+    def forward(self, features):
+        return self.forward_actor(features), self.forward_critic(features)
+
+    def forward_actor(self, features):
+        return self.policy_net(features)
+
+    def forward_critic(self, features):
+        return self.value_net(features)
+
+class LayerNormActorCriticPolicy(ActorCriticPolicy):
+    def _build_mlp_extractor(self):
+        self.mlp_extractor = LayerNormMlpExtractor(
+            self.features_dim
+        )
+
 # ============================================================
 # Training example
 # ============================================================
@@ -295,7 +341,7 @@ if __name__ == "__main__":
     check_env(ll_env, warn=True)
 
     ll_model = PPO(
-        "MlpPolicy",
+        LayerNormActorCriticPolicy,
         ll_env,
         learning_rate=3e-4,
         n_steps=512,
@@ -327,7 +373,7 @@ if __name__ == "__main__":
     check_env(hl_env, warn=True)
 
     hl_model = PPO(
-        "MlpPolicy",
+        LayerNormActorCriticPolicy,
         hl_env,
         learning_rate=3e-4,
         n_steps=512,
