@@ -28,6 +28,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import seaborn as sns
 import warnings
+import pickle
 import os
 warnings.filterwarnings("ignore")
 
@@ -61,6 +62,8 @@ from volume_model import (
 # CONFIG
 # =============================================================================
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DATA_SYN = PROJECT_ROOT / "data" / "synthetic"
+DATA_SYN_MOD = PROJECT_ROOT / "data" / "synthetic" / "models"
 DATA_DIR = PROJECT_ROOT / "data" / "raw"
 ASSETS       = ["NVDA", "AMD", "SMH", "TLT"]
 TBILL_TICKER = "DTB3"
@@ -348,7 +351,49 @@ def regime_count(start, end, label):
     dates = returns.index[regime_seq == label]
     return sum(start <= d.strftime('%Y-%m-%d') <= end for d in dates)
 
+def save_regime_csv(dates, regime_seq, regime_probs, output_path,
+                    regime_names=('Bull', 'Bear', 'SevereBear', 'Crisis')):
+    """
+    Save HMM regime labels and probabilities to CSV.
 
+    Parameters
+    ----------
+    dates : array-like of datetime, length N
+        Trading dates aligned with regime_seq.
+    regime_seq : array-like of int, length N
+        Hard regime label per date (0..3).
+    regime_probs : 2D array, shape (N, 4)
+        Soft regime probabilities per date.
+    output_path : str or Path
+        Where to write the CSV.
+    regime_names : tuple of 4 str
+        Names for the regime probability columns.
+
+    Output columns:
+        date, regime_seq, regime_prob_Bull, regime_prob_Bear,
+        regime_prob_SevereBear, regime_prob_Crisis
+    """
+    import pandas as pd
+    import numpy as np
+
+    # Validate
+    n = len(dates)
+    if len(regime_seq) != n:
+        raise ValueError(f"regime_seq length {len(regime_seq)} != dates length {n}")
+    if regime_probs.shape != (n, 4):
+        raise ValueError(f"regime_probs shape {regime_probs.shape} != ({n}, 4)")
+
+    df = pd.DataFrame({
+        'date': pd.to_datetime(dates),
+        'regime_seq': np.asarray(regime_seq, dtype=int),
+        f'regime_prob_{regime_names[0]}': regime_probs[:, 0],
+        f'regime_prob_{regime_names[1]}': regime_probs[:, 1],
+        f'regime_prob_{regime_names[2]}': regime_probs[:, 2],
+        f'regime_prob_{regime_names[3]}': regime_probs[:, 3],
+    })
+    df.to_csv(output_path, index=False)
+    print(f"Saved {len(df)} rows to {output_path}")
+    return df
 # =============================================================================
 # 3. REGIME CLASSIFICATION VIA HMM
 # =============================================================================
@@ -461,6 +506,14 @@ def fit_hmm_regimes(returns, n_regimes=N_REGIMES, feature_window=21):
     )
     print("\nTransition matrix (canonical regime order):")
     print(df_tm.round(3).to_string())
+
+    # Save it
+    with open(DATA_SYN_MOD / 'hmm_4regime.pkl', 'wb') as f:
+        pickle.dump({
+            'hmm': model,
+            'feature_window': 21,  # the window you used for make_regime_features
+            'regime_label_map': REGIME_NAMES,  # mapping from raw HMM states to canonical 0=Bull..3=Crisis
+        }, f)
 
     return regime_seq, regime_probs, model, trans_sorted
 
@@ -1146,6 +1199,24 @@ def main():
 
     regime_models = fit_per_regime(returns, volumes, regime_seq, N_REGIMES, ASSETS)
 
+    # Save the FITTED MODELS once (no seed needed)
+    dates = returns.index
+    fitted_parameters = {
+            'regime_models': regime_models,
+            'trans_mat': trans_mat,
+            'regime_seq': regime_seq,
+            'regime_probs': regime_probs,
+            'training_dates': dates,
+    }
+
+    save_regime_csv(dates=dates, regime_seq=regime_seq, regime_probs=regime_probs, output_path=DATA_SYN_MOD / 'regime_labels.csv')
+
+
+
+    with open( DATA_SYN_MOD / 'synthetic_generator_FITTED.pkl', 'wb') as f:
+        pickle.dump(fitted_parameters, f)
+
+
     print_regime_summary(regime_models, trans_mat)
 
     all_returns, all_regimes, all_volumes, all_prices = simulate_hybrid_paths(
@@ -1217,3 +1288,6 @@ def main():
 
 if __name__ == "__main__":
     outputs = main()
+    print("\n\n" + "=" * 70)
+    print('=> OUTPUTS:')
+    print(outputs)

@@ -374,9 +374,120 @@ The synthetic data generator delivers:
 
 This output is sufficient for the RL training pipeline. The next stages of the project — wavelet feature engineering, Kronos forecast integration, and the hierarchical RL environment — build on top of this synthetic data foundation.
 
+### Kronos Regime Distribution Analysis
+
+#### Overall Assessment ✅
+
+**No bucket starvation.** Smallest bucket is **4.3%** (NVDA bucket 7) — well above the 1% concern threshold. Every regime fires often enough for the RL agent to learn meaningful policy responses to it.
+
+Dominant patterns make economic sense across all four assets:
+
+| Bucket | Description | Where it's prevalent |
+|--------|-------------|----------------------|
+| 2 (low_err + high_conf) | Best forecasts | Dominant in NVDA/AMD/SMH (24-28%) |
+| 6 (high_err + low_conf) | Honestly poor forecasts | High in TLT (19.8%), AMD (16.4%) |
+| 8 (high_err + high_conf) | Overconfident | Notably high in TLT (19.1%), AMD (12.7%) |
+
+The fact that **bucket 2 is the largest bucket for the equities** says Kronos is reliably forecasting NVDA/AMD/SMH most of the time. Forecasts are accurate AND the model knows it.
+
+#### The TLT Pattern Is the Interesting Story
+
+TLT shows a strikingly different distribution from the equities:
+
+| Asset | Bucket 2 (best) | Bucket 6 (honestly bad) | Bucket 8 (overconfident) |
+|-------|-----------------|--------------------------|---------------------------|
+| NVDA  | 24.7%           | 10.9%                    | 7.5%                      |
+| AMD   | 24.3%           | 16.4%                    | 12.7%                     |
+| SMH   | **27.5%**       | 8.7%                     | 9.4%                      |
+| TLT   | 12.4%           | **19.8%**                | **19.1%**                 |
+
+For TLT, the **"bad forecast" buckets (6 + 8) sum to 38.9%**, while for SMH they only sum to 18.1%. That's a 2× higher rate of poor Kronos performance on TLT vs. semiconductors.
+
+This is consistent with the bucket-8 dates analysis done earlier. TLT had massive bucket-8 concentrations during 2007-2013 (post-GFC QE era) and 2020-2024 (post-COVID + inflation). **Kronos genuinely struggles with TLT** because central bank actions periodically restructure the bond market in ways pure technical analysis can't anticipate.
+
+The agent learning policy on this data will discover: *"Kronos forecasts for TLT are less reliable than for equities — discount them more, rely more on the regime classifier."* That's exactly the right behavior.
+
+#### Equities Differ in a Meaningful Way Too
+
+Compare AMD vs. NVDA bucket 8 specifically:
+
+| Asset | Bucket 8 (overconfident) | What this likely means |
+|-------|---------------------------|--------------------------|
+| NVDA  | 7.5%                      | Kronos rarely overconfident — appropriate humility |
+| AMD   | 12.7%                     | Frequent overconfidence |
+| SMH   | 9.4%                      | Mid-range |
+
+AMD's higher bucket-8 fraction reflects the date-level analysis: AMD has a long history of idiosyncratic events (CEO changes, near-bankruptcies, fab spinoffs) that Kronos couldn't anticipate from technical patterns. The forecaster's confidence is poorly calibrated on AMD.
+
+This is also why AMD bucket 0 is so much smaller (10.3%) than NVDA's (23.5%) — AMD has fewer "low error AND low confidence" days because Kronos is rarely cautious about AMD predictions, even when it should be.
+
+#### What This Means for the RL Agent
+
+Different regime distributions across assets means the agent will learn **asset-specific policies for using Kronos features**:
+
+- **NVDA**: Trust Kronos when bucket 2 fires (high frequency, well-calibrated)
+- **SMH**: Similar to NVDA, trust forecasts
+- **AMD**: Use Kronos forecasts cautiously — discount them when bucket 8 fires
+- **TLT**: Heavy skepticism toward Kronos — bucket 6/8 dominate, lean on regime probabilities and historical hedging behavior instead
+
+The RL state vector will have separate one-hot regime columns per asset (`NVDA_kronos_regime_0` ... `NVDA_kronos_regime_8`, `AMD_kronos_regime_0` ... etc.), so the agent has **36 binary indicators just for Kronos quality** across the 4 assets. That's enough granularity to learn these asset-specific calibration patterns.
+
+#### One Subtle Observation Worth Noting
+
+The middle bucket (bucket 4 = mid_err + mid_conf) sits at 6-9% across all assets. That's healthier than initially expected. With expanding quantiles the middle bucket *could* have been very small (since the cross-product of "exactly middle on both axes" is statistically rare), but the observed populations are reasonable.
+
+#### Bottom Line
+
+These distributions are high-quality.
+
+1. ✅ All buckets populated >4%, no starved categories
+2. ✅ Dominant buckets are economically meaningful (2, 6, 8 — the three "extreme" combinations)
+3. ✅ Asset-level differences match what you'd expect from real market dynamics
+4. ✅ TLT vs. equity asymmetry confirms Kronos struggles more with bonds (correct empirical finding)
 
 
+### Test Period Regime Distribution (2023-04 → 2026-04)
 
+#### Distribution Summary
+
+| Regime | Test % | Training % | What it means |
+|--------|--------|------------|---------------|
+| Bull | 30.9% | 39.2% | A bit less Bull than long-term average — moderate risk-on environment |
+| Bear | 30.5% | 37.7% | Comparable to historical Bear share |
+| SevereBear | 37.8% | 16.4% | **2.3× higher than training** — periods of elevated volatility were common |
+| Crisis | 0.8% | 6.8% | Almost no true crisis days |
+
+#### Economic Interpretation
+
+The distribution is a plausible reading of 2023-2026:
+
+- **The Bull share (30.9%)** captures the AI / Mag-7 rally periods (mid-2023, late-2024).
+- **The SevereBear share (37.8%)** captures the high-volatility-without-true-meltdown regime that dominated post-2022. Rate-cycle turbulence: VIX in the 17-25 range much of the time, big intraday swings, but no sustained 20%+ drawdown.
+- **The low Crisis share (0.8%)** is correct — there was no true Lehman/COVID-style crisis in 2023-2026. Even the regional bank scare in March 2023 and the August 2024 yen-carry unwind only briefly hit Crisis-level volatility.
+- **Bear (30.5%)** captures the choppy correction periods (Q3 2023, early 2024 corrections, summer 2024).
+
+#### Implications for the Agent
+
+The agent will see **predominantly SevereBear** market conditions during testing, even though that regime was only 16.4% of training data. Two implications follow: The regime classifier correctly identifies that 2023-2026 was structurally different from 2004-2022 — more volatile-without-crisis. The agent gets accurate context about what kind of market it's in.  
+
+The agent's policy in SevereBear was learned from a **smaller sample of training data** (only 779 SevereBear days in training) than its Bull/Bear policies. There's a risk that policy decisions in SevereBear are less well-calibrated. If at test time the agent underperforms specifically in SevereBear days, that is the likely cause — and it's a justification for synthetic data training (the synthetic generator can produce more SevereBear paths than the real data has).
+
+#### Validation: April 2025 Tariff Episode
+
+The April 2025 tariff announcement period was a textbook SevereBear regime — sharp moves, elevated VIX (briefly hit ~50 around April 7-8), but market structure didn't fully break down into a sustained Crisis regime because the Fed didn't have to intervene and credit markets stayed functional.
+
+The HMM correctly classifies that period as a short-lived high-volatility selloff with policy uncertainty, not Lehman-scale systemic stress. The fact that Crisis only fires 0.8% of the time on the test set says: "yes, there were turbulent periods, but no true tail-risk crisis events that required emergency action." That matches reality.
+
+#### Why This Matters
+
+This is useful validation that the regime classifier is **economically calibrated**, not just statistically fitted. It distinguishes between:
+
+- **SevereBear**: high vol, big drawdowns, but functional markets (April 2025 tariffs, August 2024 yen carry, March 2023 SVB)
+- **Crisis**: vol explodes, correlations break down, hedges fail, central banks step in (2008 Lehman, 2020 COVID, late-2022 inflation panic)
+
+The agent trained on this data will learn that these regimes are different — and policy responses can differ. SevereBear might call for reduced gross exposure but maintained allocations. Crisis might call for full deleveraging and TLT skepticism (since TLT also broke down in 2022).
+
+This is exactly the kind of regime-aware behavior the project is designed to capture.
 
 
 
