@@ -6,6 +6,7 @@
     <content url="file://$MODULE_DIR$" />
     <orderEntry type="jdk" jdkName="Python 3.10 virtualenv at ~/.pyenv/versions/jupyter-env" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
+    <orderEntry type="module" module-name="Mag7" />
   </component>
   <component name="PyDocumentationSettings">
     <option name="format" value="NUMPY" />
