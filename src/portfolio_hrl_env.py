@@ -1,4 +1,6 @@
+from typing import Tuple
 import numpy as np
+import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
 
@@ -313,6 +315,28 @@ class LayerNormActorCriticPolicy(ActorCriticPolicy):
             self.features_dim
         )
 
+def process_raw_df(
+    df: pd.DataFrame
+) -> Tuple[np.ndarray, np.ndarray]:
+    price_cols = [
+        "NVDA_close",
+        "AMD_close",
+        "SMH_close",
+        "TLT_close"
+    ]
+    
+    features_df = df.copy()
+    features_df.drop(['date'] + price_cols, axis=1, inplace=True)
+    features = features_df.to_numpy(dtype=np.float32)
+
+    returns_df = df[price_cols].pct_change()
+    returns_df = returns_df.replace([np.inf, -np.inf], np.nan)
+    returns_df = returns_df.fillna(0.0)
+    returns = returns_df.to_numpy(dtype=np.float32)
+    
+    return features, returns
+    
+    
 # ============================================================
 # Training example
 # ============================================================
@@ -321,18 +345,20 @@ if __name__ == "__main__":
     n_days = 1_000
     feature_dim = 64
     n_assets = 4  # NVDA, AMD, SMH, TLT
-
-    features = np.random.randn(n_days, feature_dim).astype(np.float32)
-    returns = np.random.randn(n_days, n_assets).astype(np.float32) * 0.02
-    benchmark_returns = returns[:, 2]  # SMH benchmark example
+    
+    train_df = pd.read_csv('../data/proccessed/combined_w_cross_asset/train/RL_Final_Merged_train.csv')
+    test_df = pd.read_csv('../data/proccessed/combined_w_cross_asset/test/RL_Final_Merged_test.csv')
+    
+    train_features, train_returns = process_raw_df(train_df)
+    benchmark_returns = train_returns[:, :3].mean(axis=1)
 
     # ----------------------------
     # 1. Train low-level PPO first
     # ----------------------------
 
     ll_core = PortfolioCore(
-        features=features,
-        returns=returns,
+        features=train_features,
+        returns=train_returns,
         benchmark_returns=benchmark_returns,
     )
 
@@ -360,8 +386,8 @@ if __name__ == "__main__":
     # ----------------------------
 
     hl_core = PortfolioCore(
-        features=features,
-        returns=returns,
+        features=train_features,
+        returns=train_returns,
         benchmark_returns=benchmark_returns,
     )
 
