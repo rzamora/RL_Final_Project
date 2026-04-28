@@ -1,29 +1,30 @@
 """
-Fixed and improved version of portfolio_hrl_env.py.
+Portfolio HRL environment with rolling-window risk and asymmetric benchmark reward.
 
-Changes vs original (see 01_code_review.md for details):
+Reward design philosophy:
+- Penalize sustained drawdowns relative to benchmark (rolling 21d and 63d windows),
+  not single-day equity dips. A real PM is judged on monthly losses, not intraday vol.
+- Reward upside-capture and crisis alpha asymmetrically:
+    Up market, missed rally:        HEAVY penalty (career risk)
+    Up market, outperformance:      mild bonus
+    Down market, excess loss:       mild penalty (acceptable in selloffs)
+    Down market, made money/up:     HEAVY bonus (crisis alpha is the prize)
+- This produces a policy that participates in rallies, protects in selloffs,
+  and is genuinely incentivized to generate alpha during crises.
 
-  Bug 1 — process_raw_df schema now matches synthetic pool (317 features, no
-          *_close drop). Returns are computed from the price columns separately.
-  Bug 2 — parse_ll_action uses long/short-book projection. Gross and net
-          targets are exactly satisfied (up to float precision).
-  Bug 3 — Sleeve mechanism removed for v1. The README's sleeve concept can be
-          re-added later; for now we have an honest "full portfolio output"
-          policy with turnover penalty doing the smoothing job.
-  Issue 4 — reset() supports random episode starts with configurable length.
-  Issue 11 — done condition uses all rows.
-  Issue 14 — RNG plumbed through.
-
-The training script at the bottom shows the recommended pipeline:
-   synthetic pre-train → real fine-tune.
-
-Drop-in compatible with stable-baselines3 PPO.
+Changes vs. previous version:
+- Drawdown is computed on rolling windows (21d, 63d), not all-time peak
+- Drawdown is measured as EXCESS over benchmark (agent_dd - bench_dd), not absolute
+- Benchmark tracking is over a 63-day cumulative excess window with 21-day warmup
+- Asymmetric reward shape: 4 separate lambdas for the up/down × beat/miss matrix
+- Obs vector exposes excess_dd_short, quarterly_excess, quarterly_bench to the agent
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -47,81 +48,36 @@ def process_raw_df(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray
     """
     Convert the merged CSV to (features, returns, prices).
 
-    Why we drop the *_close columns from features:
-        Absolute price levels are a temporal fingerprint. NVDA at $0.11 in 2004
-        and at $140 in 2024 lets the policy network learn "where in time am I"
-        directly from the price magnitude, which leaks the calendar position
-        into the policy. A regime-aware policy should be invariant to absolute
-        price level — only relative changes (returns, ratios) carry signal.
-
-    The four *_close columns are kept on the side (returned as `prices`) for
-    use by anything downstream that needs them (return computation already
-    does pct_change separately, but other consumers like benchmark code or
-    diagnostic plots may want raw prices).
-
-    Note: *_kronos_close_d5 is NOT dropped. Despite the name, it stores the
-    Kronos-predicted return as a fraction (e.g. -0.0068, +0.012), not a
-    dollar price. So it doesn't leak calendar position.
-
-    features: (T, 313) — all CSV columns except `date` and the 4 *_close cols.
-    returns:  (T, 4)   — pct_change of the four close columns, NaN→0.
-    prices:   (T, 4)   — raw close prices, kept for downstream use.
+    Drops *_close columns from features (they're absolute price levels that
+    leak the calendar position). Prices kept on the side for return calc.
     """
     price_cols = list(PRICE_COLS)
-
     feats_df = df.drop(columns=["date"] + price_cols)
     features = feats_df.to_numpy(dtype=np.float32)
-
     prices = df[price_cols].to_numpy(dtype=np.float32)
 
     rets_df = df[price_cols].pct_change()
     rets_df = rets_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     returns = rets_df.to_numpy(dtype=np.float32)
 
-    # Defensive NaN scrub on features. Some technical indicators have small
-    # warmup windows that may not have been trimmed.
     features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-
     return features, returns, prices
 
 
-def load_synthetic_pool(
-    npz_path: str,
-    drop_close_features: bool = True,
-) -> dict:
-    """
-    Load the synthetic pool and (by default) strip the *_close columns from
-    the feature tensor — same reason as in process_raw_df: absolute price
-    levels would leak calendar position into the policy. The close prices
-    remain available via pool['prices'] for downstream use.
-
-    The pool's `feature_names` array tells us which columns to drop.
-
-    Returns a dict with:
-        features: (N, T, 313) if drop_close_features else (N, T, 317)
-        returns:  (N, T, 4)
-        prices:   (N, T, 4) — extracted from the *_close feature columns
-                              before they were dropped (so the agent's env
-                              has a price series even on synthetic paths)
-        regimes:  (N, T) or None
-        feature_names: list of feature names AFTER dropping (if any)
-    """
+def load_synthetic_pool(npz_path: str, drop_close_features: bool = True) -> dict:
+    """Load synthetic pool, optionally stripping *_close features (recommended)."""
     data = np.load(npz_path, allow_pickle=True)
-    features = data["features"]              # (N, T, 317)
-    returns = data["returns"]                # (N, T, 4)
+    features = data["features"]
+    returns = data["returns"]
     feature_names = list(data["feature_names"]) if "feature_names" in data.files else None
 
     prices = None
-
     if drop_close_features and feature_names is not None:
         close_idx = [i for i, n in enumerate(feature_names) if n in PRICE_COLS]
         if len(close_idx) != len(PRICE_COLS):
             raise ValueError(
-                f"Expected {len(PRICE_COLS)} close columns in pool features, "
-                f"found {len(close_idx)}. Pool schema may not match CSV."
+                f"Expected {len(PRICE_COLS)} close columns, found {len(close_idx)}"
             )
-        # Reorder close_idx to match PRICE_COLS order so prices columns line up
-        # with returns columns.
         name_to_idx = {feature_names[i]: i for i in close_idx}
         ordered_idx = [name_to_idx[name] for name in PRICE_COLS]
         prices = features[:, :, ordered_idx].astype(np.float32)
@@ -141,27 +97,66 @@ def load_synthetic_pool(
 
 
 # ============================================================
-# Portfolio core
+# Config
 # ============================================================
 
 @dataclass
 class CoreConfig:
+    """All env hyperparameters. Tweakable, but the defaults encode an
+    institutional risk-management philosophy: rolling-window drawdowns,
+    excess-relative-to-benchmark penalties, asymmetric upside/crisis-alpha
+    rewards."""
+
     max_gross: float = 1.5
     initial_equity: float = 1.0
-    dd_threshold: float = 0.15
-    lambda_dd: float = 10.0
-    lambda_turnover: float = 0.01
-    lambda_down: float = 0.5
     episode_length: int = 384
 
+    # Excess-drawdown windows and thresholds.
+    # Penalty fires when (agent_dd - bench_dd) exceeds the threshold over the
+    # window. Excess drawdown is the right metric: a 30% drawdown alongside a
+    # 30% benchmark drawdown is acceptable; a 30% drawdown when benchmark is
+    # flat is the manager's fault.
+    dd_window_short: int = 21          # 1-month rolling
+    dd_window_long: int = 63           # 1-quarter rolling
+    dd_threshold_short: float = 0.05   # 5% excess dd over 1 month
+    dd_threshold_long: float = 0.10    # 10% excess dd over 1 quarter
+    lambda_dd_short: float = 10.0
+    lambda_dd_long: float = 5.0
+
+    # Trading cost
+    lambda_turnover: float = 0.01
+
+    # Asymmetric quarterly benchmark tracking.
+    # No penalty/bonus until the rolling window has at least `benchmark_warmup`
+    # days of data. Threshold is the symmetric tolerance band (±2% over the
+    # quarter is the "no signal" zone).
+    benchmark_window: int = 63
+    benchmark_warmup: int = 21
+    benchmark_threshold: float = 0.02
+
+    # The four asymmetric lambdas.
+    # Heavy weight (1.5) on the regime-correct extreme outcomes:
+    #   - Failing to participate in a rally (career risk)
+    #   - Generating crisis alpha (the prize)
+    # Mild weight (0.3) on regime-incorrect outcomes:
+    #   - Outperforming in a rally (alpha is nice but not required)
+    #   - Underperforming in a selloff (forgivable, world is bad)
+    lambda_upside_miss:     float = 1.5
+    lambda_upside_beat:     float = 0.3
+    lambda_downside_excess: float = 0.3
+    lambda_crisis_alpha:    float = 1.5
+
+
+# ============================================================
+# Portfolio core
+# ============================================================
 
 class PortfolioCore:
-    """
-    Stateful portfolio simulator. No sleeves in this version (see Bug 3 in
-    01_code_review.md). The LL action is the full target portfolio.
+    """Stateful portfolio simulator with rolling-window risk tracking.
 
-    Random episode starts: when reset() is called, picks a random window of
-    length cfg.episode_length within the available data.
+    Maintains parallel agent and benchmark equity curves so all risk metrics
+    are computed *relative* to benchmark. Rolling windows mean intraday
+    volatility doesn't trigger penalties — only sustained drawdowns do.
     """
 
     def __init__(
@@ -176,7 +171,6 @@ class PortfolioCore:
         self.returns = returns.astype(np.float32)
 
         if benchmark_returns is None:
-            # Default: equal-weight on first 3 assets (NVDA, AMD, SMH).
             benchmark_returns = self.returns[:, :3].mean(axis=1)
         self.benchmark_returns = benchmark_returns.astype(np.float32)
 
@@ -195,6 +189,15 @@ class PortfolioCore:
 
         self.reset()
 
+    def _init_windows(self):
+        """Create empty rolling windows. Called from reset()."""
+        self.equity_window_short      = deque(maxlen=self.cfg.dd_window_short)
+        self.equity_window_long       = deque(maxlen=self.cfg.dd_window_long)
+        self.bench_equity_window_short = deque(maxlen=self.cfg.dd_window_short)
+        self.bench_equity_window_long  = deque(maxlen=self.cfg.dd_window_long)
+        self.excess_window            = deque(maxlen=self.cfg.benchmark_window)
+        self.bench_window             = deque(maxlen=self.cfg.benchmark_window)
+
     def reset(self, seed: Optional[int] = None) -> None:
         if seed is not None:
             self.rng = np.random.default_rng(seed)
@@ -204,21 +207,44 @@ class PortfolioCore:
         self.t_end = self.t_start + self.cfg.episode_length
         self.t = self.t_start
 
+        # Agent and benchmark both start at the same equity, evolve in parallel
         self.equity = self.cfg.initial_equity
-        self.peak_equity = self.cfg.initial_equity
-        self.drawdown = 0.0
-        self.benchmark_gap = 0.0
+        self.bench_equity = self.cfg.initial_equity
+
+        # Risk metrics, all initialized to no-stress
+        self.excess_dd_short = 0.0
+        self.excess_dd_long = 0.0
+        self.quarterly_excess = 0.0
+        self.quarterly_bench = 0.0
+
         self.weights = np.zeros(self.n_assets, dtype=np.float32)
+
+        self._init_windows()
+        # Seed the equity windows with starting equity so first-step drawdown is 0
+        self.equity_window_short.append(self.equity)
+        self.equity_window_long.append(self.equity)
+        self.bench_equity_window_short.append(self.bench_equity)
+        self.bench_equity_window_long.append(self.bench_equity)
 
     @property
     def steps_remaining(self) -> int:
         return self.t_end - self.t
 
     def portfolio_state(self) -> np.ndarray:
+        """The portfolio state portion of the obs vector. 10 elements:
+        equity, excess_dd_short, gross, net, w[4], quarterly_excess, quarterly_bench."""
         gross = float(np.sum(np.abs(self.weights)))
         net = float(np.sum(self.weights))
         return np.array(
-            [self.equity, self.drawdown, gross, net, *self.weights, self.benchmark_gap],
+            [
+                self.equity,
+                self.excess_dd_short,
+                gross,
+                net,
+                *self.weights,
+                self.quarterly_excess,
+                self.quarterly_bench,
+            ],
             dtype=np.float32,
         )
 
@@ -226,14 +252,13 @@ class PortfolioCore:
         return np.concatenate([self.features[self.t], self.portfolio_state()]).astype(np.float32)
 
     # ------------------------------------------------------------------
-    # Action parsing — fixed projection
+    # Action parsing — fixed projection (handles longs and shorts correctly)
     # ------------------------------------------------------------------
 
     def parse_hl_action(self, hl_action: np.ndarray) -> Tuple[float, float]:
-        """HL action ∈ [-1, 1]^2 → (target_gross, target_net)."""
         gross_raw, net_raw = float(hl_action[0]), float(hl_action[1])
-        target_gross = (gross_raw + 1.0) / 2.0 * self.cfg.max_gross  # ∈ [0, max_gross]
-        target_net = net_raw * target_gross                          # ∈ [-target_gross, target_gross]
+        target_gross = (gross_raw + 1.0) / 2.0 * self.cfg.max_gross
+        target_net = net_raw * target_gross
         return target_gross, target_net
 
     def parse_ll_action(
@@ -242,37 +267,30 @@ class PortfolioCore:
         target_gross: float,
         target_net: float,
     ) -> np.ndarray:
-        """
-        Long/short book projection. After this:
-          |w|.sum() == target_gross   (exact, up to float)
-          w.sum()   == target_net     (exact, up to float)
-        unless the agent's chosen direction can't satisfy both — in which case
-        target_net is best-effort.
-        """
+        """Long/short book projection. Honors target_net exactly; gross is
+        best-effort when LL signal lacks the necessary sign for shorts."""
         raw = np.asarray(ll_action, dtype=np.float64)
         target_gross = float(np.clip(target_gross, 0.0, self.cfg.max_gross))
         target_net = float(np.clip(target_net, -target_gross, target_gross))
 
-        long_gross = 0.5 * (target_gross + target_net)   # ≥ 0
-        short_gross = 0.5 * (target_gross - target_net)  # ≥ 0
+        long_gross = 0.5 * (target_gross + target_net)
+        short_gross = 0.5 * (target_gross - target_net)
 
         pos = np.maximum(raw, 0.0)
         neg = np.maximum(-raw, 0.0)
         pos_sum = pos.sum()
         neg_sum = neg.sum()
 
-        # Build long and short books separately, fall back to uniform within
-        # each side when the agent provides no signal on that side.
         if pos_sum > 1e-8:
             long_book = (pos / pos_sum) * long_gross
-        elif long_gross > 0:
+        elif long_gross > 1e-8:
             long_book = np.full(self.n_assets, long_gross / self.n_assets)
         else:
             long_book = np.zeros(self.n_assets)
 
         if neg_sum > 1e-8:
             short_book = (neg / neg_sum) * short_gross
-        elif short_gross > 0:
+        elif short_gross > 1e-8:
             short_book = np.full(self.n_assets, short_gross / self.n_assets)
         else:
             short_book = np.zeros(self.n_assets)
@@ -287,21 +305,47 @@ class PortfolioCore:
         old_weights = self.weights.copy()
         self.weights = new_weights.astype(np.float32)
 
+        # Realize portfolio and benchmark returns for this step
         asset_returns = self.returns[self.t]
         portfolio_return = float(np.dot(self.weights, asset_returns))
-
-        # Cash earns 0 here; can be replaced with rf_daily if desired.
-        # cash_weight = 1.0 - np.sum(np.abs(self.weights))
-
-        self.equity *= 1.0 + portfolio_return
-        self.peak_equity = max(self.peak_equity, self.equity)
-        self.drawdown = 1.0 - self.equity / self.peak_equity
-
-        turnover = float(np.sum(np.abs(self.weights - old_weights)))
-
         bench_return = float(self.benchmark_returns[self.t])
-        relative = portfolio_return - bench_return
-        self.benchmark_gap = 0.05 * relative + 0.95 * self.benchmark_gap
+
+        # Update equity curves in parallel
+        self.equity *= 1.0 + portfolio_return
+        self.bench_equity *= 1.0 + bench_return
+
+        # Update rolling equity windows
+        self.equity_window_short.append(self.equity)
+        self.equity_window_long.append(self.equity)
+        self.bench_equity_window_short.append(self.bench_equity)
+        self.bench_equity_window_long.append(self.bench_equity)
+
+        # Drawdowns from rolling-window peaks
+        agent_peak_short = max(self.equity_window_short)
+        agent_peak_long = max(self.equity_window_long)
+        bench_peak_short = max(self.bench_equity_window_short)
+        bench_peak_long = max(self.bench_equity_window_long)
+
+        agent_dd_short = 1.0 - self.equity / agent_peak_short
+        agent_dd_long = 1.0 - self.equity / agent_peak_long
+        bench_dd_short = 1.0 - self.bench_equity / bench_peak_short
+        bench_dd_long = 1.0 - self.bench_equity / bench_peak_long
+
+        # Excess drawdown (the agent's idiosyncratic underwater-ness)
+        # > 0 means agent is in deeper drawdown than benchmark (bad)
+        # ≤ 0 means agent is doing better than benchmark in dd terms (fine)
+        self.excess_dd_short = agent_dd_short - bench_dd_short
+        self.excess_dd_long = agent_dd_long - bench_dd_long
+
+        # Quarterly cumulative excess return + benchmark return
+        excess = portfolio_return - bench_return
+        self.excess_window.append(excess)
+        self.bench_window.append(bench_return)
+        self.quarterly_excess = sum(self.excess_window)
+        self.quarterly_bench = sum(self.bench_window)
+
+        # Turnover
+        turnover = float(np.sum(np.abs(self.weights - old_weights)))
 
         reward = self._reward(portfolio_return, turnover)
 
@@ -310,44 +354,76 @@ class PortfolioCore:
 
         info = {
             "equity": self.equity,
-            "drawdown": self.drawdown,
+            "bench_equity": self.bench_equity,
+            "excess_dd_short": self.excess_dd_short,
+            "excess_dd_long": self.excess_dd_long,
+            "agent_dd_short": agent_dd_short,
+            "bench_dd_short": bench_dd_short,
             "weights": self.weights.copy(),
             "turnover": turnover,
             "portfolio_return": portfolio_return,
             "benchmark_return": bench_return,
+            "quarterly_excess": self.quarterly_excess,
+            "quarterly_bench": self.quarterly_bench,
         }
         return reward, done, info
 
     def _reward(self, portfolio_return: float, turnover: float) -> float:
-        # log growth, capped to avoid -inf at full loss
+        # 1. Log growth — direct reward for absolute returns
         r = max(portfolio_return, -0.999)
         reward = float(np.log1p(r))
 
-        # convex drawdown penalty above threshold
-        dd_excess = max(0.0, self.drawdown - self.cfg.dd_threshold)
-        reward -= self.cfg.lambda_dd * dd_excess ** 2
+        # 2. Excess-drawdown penalties on rolling windows.
+        #    Only fires when agent is in deeper drawdown than benchmark by more
+        #    than the threshold. A 30% drawdown alongside a 30% benchmark
+        #    drawdown produces zero penalty here.
+        excess_dd_short_above = max(0.0, self.excess_dd_short - self.cfg.dd_threshold_short)
+        reward -= self.cfg.lambda_dd_short * excess_dd_short_above ** 2
 
-        # turnover penalty
+        excess_dd_long_above = max(0.0, self.excess_dd_long - self.cfg.dd_threshold_long)
+        reward -= self.cfg.lambda_dd_long * excess_dd_long_above ** 2
+
+        # 3. Turnover penalty
         reward -= self.cfg.lambda_turnover * turnover
 
-        # asymmetric benchmark penalty (downside only — README's λ_up is omitted
-        # by design; see Issue 7 in the code review)
-        if self.benchmark_gap < 0:
-            reward -= self.cfg.lambda_down * abs(self.benchmark_gap)
+        # 4. Asymmetric quarterly benchmark term.
+        #    Doesn't fire until the rolling window has at least benchmark_warmup
+        #    days of data. Two-sided asymmetry:
+        #    - Bench up: failing to participate is heavily penalized, beating
+        #      it gives a mild bonus.
+        #    - Bench down: excess loss is mildly penalized, generating crisis
+        #      alpha gives a heavy bonus.
+        if len(self.excess_window) >= self.cfg.benchmark_warmup:
+            excess_above_band = self.quarterly_excess - self.cfg.benchmark_threshold
+            excess_below_band = -(self.quarterly_excess + self.cfg.benchmark_threshold)
+
+            if self.quarterly_bench > 0:
+                # Up market
+                if excess_below_band > 0:
+                    # Missed the rally — career risk
+                    reward -= self.cfg.lambda_upside_miss * excess_below_band
+                elif excess_above_band > 0:
+                    # Outperformed in a rally — mild bonus
+                    reward += self.cfg.lambda_upside_beat * excess_above_band
+            else:
+                # Down market
+                if excess_below_band > 0:
+                    # Underperformed in a selloff — mild penalty
+                    reward -= self.cfg.lambda_downside_excess * excess_below_band
+                elif excess_above_band > 0:
+                    # Crisis alpha — the prize
+                    reward += self.cfg.lambda_crisis_alpha * excess_above_band
 
         return float(reward)
 
 
 # ============================================================
-# Pool sampler — wraps a synthetic pool as a sequence of cores
+# Pool sampler
 # ============================================================
 
 class SyntheticPoolCoreSampler:
-    """
-    Behaves like a PortfolioCore but on each reset, picks a random path from
-    the synthetic pool to use as the underlying data. Implements the same
-    interface so the env code doesn't change.
-    """
+    """Acts like a PortfolioCore but each reset() picks a random path from
+    the synthetic pool. Same interface, same risk tracking."""
 
     def __init__(
         self,
@@ -355,8 +431,8 @@ class SyntheticPoolCoreSampler:
         cfg: Optional[CoreConfig] = None,
         rng: Optional[np.random.Generator] = None,
     ):
-        self.pool_features = pool["features"]   # (N, T, 317)
-        self.pool_returns = pool["returns"]     # (N, T, 4)
+        self.pool_features = pool["features"]
+        self.pool_returns = pool["returns"]
         self.cfg = cfg or CoreConfig()
         self.rng = rng or np.random.default_rng()
 
@@ -379,34 +455,26 @@ class SyntheticPoolCoreSampler:
         self.current_path = int(self.rng.integers(0, self.n_paths))
         feats = self.pool_features[self.current_path]
         rets = self.pool_returns[self.current_path]
-
-        # NaN scrub (defensive — pool is reportedly NaN-free, but cheap insurance)
         feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
-
         self._core = PortfolioCore(feats, rets, cfg=self.cfg, rng=self.rng)
-        # PortfolioCore.__init__ already calls reset() which picks a random
-        # window within the path. For pool paths of length 384 with episode
-        # length 384, that window is the whole path.
 
     def __getattr__(self, name):
-        # Delegate everything to the inner core
         return getattr(self._core, name)
 
 
 # ============================================================
-# Environments
+# Environments — observation space accounts for the new state vector
 # ============================================================
 
 class LowLevelPortfolioEnv(gym.Env):
-    """
-    LL env. HL action is fixed (rule-based) during LL training.
-    """
+    """LL env. HL action is fixed (rule-based) during LL training.
+    Obs = features (313) + portfolio_state (10) + hl_action (2) = 325 dim."""
 
     metadata = {"render_modes": []}
 
     def __init__(
         self,
-        core,                              # PortfolioCore or SyntheticPoolCoreSampler
+        core,
         fixed_hl_action: Optional[np.ndarray] = None,
     ):
         super().__init__()
@@ -417,8 +485,10 @@ class LowLevelPortfolioEnv(gym.Env):
             else np.asarray(fixed_hl_action, dtype=np.float32)
         )
 
-        # core.feature_dim + portfolio_state(4 + n_assets + 1) + hl_action(2)
-        obs_dim = core.feature_dim + 4 + core.n_assets + 1 + 2
+        # 313 features + 10 portfolio state (equity, excess_dd, gross, net,
+        # 4 weights, q_excess, q_bench) + 2 HL action = 325
+        portfolio_state_dim = 4 + core.n_assets + 2  # equity, excess_dd, gross, net + n_assets weights + q_excess, q_bench
+        obs_dim = core.feature_dim + portfolio_state_dim + 2
         self.observation_space = spaces.Box(low=-1e6, high=1e6, shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(core.n_assets,), dtype=np.float32)
 
@@ -438,9 +508,7 @@ class LowLevelPortfolioEnv(gym.Env):
 
 
 class HighLevelPortfolioEnv(gym.Env):
-    """
-    HL env. LL is frozen and used inside the env.
-    """
+    """HL env. LL is frozen. Obs = features + portfolio_state = 323 dim."""
 
     metadata = {"render_modes": []}
 
@@ -449,7 +517,8 @@ class HighLevelPortfolioEnv(gym.Env):
         self.core = core
         self.ll_model = ll_model
 
-        obs_dim = core.feature_dim + 4 + core.n_assets + 1
+        portfolio_state_dim = 4 + core.n_assets + 2
+        obs_dim = core.feature_dim + portfolio_state_dim
         self.observation_space = spaces.Box(low=-1e6, high=1e6, shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
@@ -470,7 +539,7 @@ class HighLevelPortfolioEnv(gym.Env):
 
 
 # ============================================================
-# Policy with LayerNorm
+# Policy
 # ============================================================
 
 class LayerNormMlpExtractor(nn.Module):
@@ -511,7 +580,7 @@ class LayerNormActorCriticPolicy(ActorCriticPolicy):
 
 
 # ============================================================
-# Vectorized env builders
+# Vec env helpers
 # ============================================================
 
 def make_vec_env(
@@ -523,16 +592,10 @@ def make_vec_env(
     seed: int = 0,
     **env_kwargs,
 ):
-    """
-    core_factory: callable(rank) -> PortfolioCore | SyntheticPoolCoreSampler
-    env_class:    LowLevelPortfolioEnv or HighLevelPortfolioEnv
-    """
-
     def _make(rank):
         def _init():
             core = core_factory(rank)
-            env = env_class(core, **env_kwargs)
-            return env
+            return env_class(core, **env_kwargs)
         return _init
 
     fns = [_make(i) for i in range(n_envs)]
@@ -543,154 +606,3 @@ def make_vec_env(
         vec = VecNormalize(vec, norm_obs=True, norm_reward=False, clip_obs=10.0)
 
     return vec
-
-
-# ============================================================
-# Training pipeline (illustrative)
-# ============================================================
-
-def train_pipeline(
-    train_csv_path: str,
-    synthetic_pool_path: str,
-    out_dir: str = "./checkpoints",
-    seed: int = 0,
-    pretrain_steps: int = 2_000_000,
-    finetune_steps: int = 500_000,
-    n_envs_pretrain: int = 8,
-    n_envs_finetune: int = 4,
-):
-    """
-    Phase 1: synthetic pre-train  (LL then HL)
-    Phase 2: real fine-tune       (LL then HL)
-
-    Run 5 seeds for proper variance estimation.
-    """
-    from pathlib import Path
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-
-    # ----------------------------
-    # Load data
-    # ----------------------------
-    pool = load_synthetic_pool(synthetic_pool_path, drop_close_features=True)
-    train_df = pd.read_csv(train_csv_path)
-    train_features, train_returns, train_prices = process_raw_df(train_df)
-
-    # Sanity check: synthetic features and real features must have the same
-    # second dimension after dropping closes. If this fails, the synthetic
-    # pool was built with a different feature set than the CSV.
-    assert pool["features"].shape[2] == train_features.shape[1], (
-        f"Feature-dim mismatch: pool has {pool['features'].shape[2]}, "
-        f"real has {train_features.shape[1]}. Both should be 313."
-    )
-
-    # Train/val split: hold out last 252 days of train as validation
-    val_split = len(train_features) - 252
-    train_feat_split = train_features[:val_split]
-    train_ret_split = train_returns[:val_split]
-
-    cfg = CoreConfig(episode_length=384)
-
-    # ============================================================
-    # PHASE 1A: LL on synthetic
-    # ============================================================
-    def synth_core(rank):
-        return SyntheticPoolCoreSampler(
-            pool, cfg=cfg, rng=np.random.default_rng(seed * 1000 + rank)
-        )
-
-    ll_env = make_vec_env(
-        synth_core, LowLevelPortfolioEnv,
-        n_envs=n_envs_pretrain, vecnormalize=True, seed=seed,
-    )
-
-    ll_model = PPO(
-        LayerNormActorCriticPolicy,
-        ll_env,
-        learning_rate=3e-4,
-        n_steps=512,
-        batch_size=256,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01,
-        verbose=1,
-        seed=seed,
-    )
-    ll_model.learn(total_timesteps=pretrain_steps)
-    ll_model.save(f"{out_dir}/ll_synth_pretrain_seed{seed}")
-    ll_env.save(f"{out_dir}/ll_synth_vecnorm_seed{seed}.pkl")
-
-    # ============================================================
-    # PHASE 1B: HL on synthetic, frozen LL
-    # ============================================================
-    hl_env_synth = make_vec_env(
-        synth_core, HighLevelPortfolioEnv,
-        n_envs=n_envs_pretrain, vecnormalize=True, seed=seed + 100,
-        ll_model=ll_model,
-    )
-
-    hl_model = PPO(
-        LayerNormActorCriticPolicy,
-        hl_env_synth,
-        learning_rate=3e-4,
-        n_steps=512,
-        batch_size=256,
-        clip_range=0.2,
-        ent_coef=0.01,
-        verbose=1,
-        seed=seed + 100,
-    )
-    hl_model.learn(total_timesteps=pretrain_steps // 2)
-    hl_model.save(f"{out_dir}/hl_synth_pretrain_seed{seed}")
-    hl_env_synth.save(f"{out_dir}/hl_synth_vecnorm_seed{seed}.pkl")
-
-    # ============================================================
-    # PHASE 2A: LL fine-tune on real
-    # ============================================================
-    def real_core(rank):
-        return PortfolioCore(
-            train_feat_split, train_ret_split,
-            cfg=cfg, rng=np.random.default_rng(seed * 2000 + rank),
-        )
-
-    ll_env_real = make_vec_env(
-        real_core, LowLevelPortfolioEnv,
-        n_envs=n_envs_finetune, vecnormalize=True, seed=seed + 200,
-    )
-    # Lower LR + clip range for fine-tuning
-    ll_model.set_env(ll_env_real)
-    ll_model.learning_rate = 1e-4
-    ll_model.clip_range = lambda _: 0.1
-    ll_model.learn(total_timesteps=finetune_steps, reset_num_timesteps=False)
-    ll_model.save(f"{out_dir}/ll_real_finetune_seed{seed}")
-    ll_env_real.save(f"{out_dir}/ll_real_vecnorm_seed{seed}.pkl")
-
-    # ============================================================
-    # PHASE 2B: HL fine-tune on real
-    # ============================================================
-    hl_env_real = make_vec_env(
-        real_core, HighLevelPortfolioEnv,
-        n_envs=n_envs_finetune, vecnormalize=True, seed=seed + 300,
-        ll_model=ll_model,
-    )
-    hl_model.set_env(hl_env_real)
-    hl_model.learning_rate = 1e-4
-    hl_model.clip_range = lambda _: 0.1
-    hl_model.learn(total_timesteps=finetune_steps // 2, reset_num_timesteps=False)
-    hl_model.save(f"{out_dir}/hl_real_finetune_seed{seed}")
-    hl_env_real.save(f"{out_dir}/hl_real_vecnorm_seed{seed}.pkl")
-
-    print(f"[seed {seed}] training pipeline complete.")
-    return ll_model, hl_model
-
-
-if __name__ == "__main__":
-    # Single-seed example. For real results, run 5 seeds.
-    train_pipeline(
-        train_csv_path="data/proccessed/combined_w_cross_asset/train/RL_Final_Merged_train.csv",
-        synthetic_pool_path="data/synthetic/pools/synthetic_pool_production_n2000_seed43.npz",
-        out_dir="./checkpoints/seed0",
-        seed=0,
-        pretrain_steps=2_000_000,
-        finetune_steps=500_000,
-    )

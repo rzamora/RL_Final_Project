@@ -1,14 +1,14 @@
 """
-Step 2 — Environment smoke test.
+Step 2 — Environment smoke test (updated for asymmetric reward function).
 
 Verifies that PortfolioCore + LowLevelPortfolioEnv:
   - Construct without errors
   - Run a complete episode of exactly cfg.episode_length steps
-  - Produce observations of the expected shape
+  - Produce observations of the expected shape (325 dim for LL env)
   - Keep equity positive throughout
-  - Keep drawdown in [0, 1]
+  - Keep excess_dd_short within [-1, 1]
   - Honor the gross leverage cap (|w|.sum() <= max_gross)
-  - Populate the info dict correctly
+  - Populate the new info dict correctly
 
 Run from project root: `python tests/test_02_env.py`
 """
@@ -48,16 +48,22 @@ def main():
     env = LowLevelPortfolioEnv(core)
 
     print(f"\nCore configured:")
-    print(f"  episode_length: {core.cfg.episode_length}")
-    print(f"  max_gross:      {core.cfg.max_gross}")
-    print(f"  dd_threshold:   {core.cfg.dd_threshold}")
-    print(f"  feature_dim:    {core.feature_dim}")
-    print(f"  n_assets:       {core.n_assets}")
+    print(f"  episode_length:    {core.cfg.episode_length}")
+    print(f"  max_gross:         {core.cfg.max_gross}")
+    print(f"  dd_window_short:   {core.cfg.dd_window_short}d, threshold {core.cfg.dd_threshold_short:.0%}")
+    print(f"  dd_window_long:    {core.cfg.dd_window_long}d, threshold {core.cfg.dd_threshold_long:.0%}")
+    print(f"  benchmark_window:  {core.cfg.benchmark_window}d, threshold {core.cfg.benchmark_threshold:.0%}")
+    print(f"  lambda upside:     miss={core.cfg.lambda_upside_miss}, beat={core.cfg.lambda_upside_beat}")
+    print(f"  lambda downside:   crisis_alpha={core.cfg.lambda_crisis_alpha}, excess={core.cfg.lambda_downside_excess}")
+    print(f"  feature_dim:       {core.feature_dim}")
+    print(f"  n_assets:          {core.n_assets}")
 
     # ---------- Verify observation/action spaces ----------
-    obs_dim_expected = core.feature_dim + 4 + core.n_assets + 1 + 2
-    # = 313 (features) + 4 (equity, dd, gross, net) + 4 (weights) + 1 (bench gap) + 2 (HL action)
-    # = 324
+    # Portfolio state has 10 elements:
+    #   equity, excess_dd_short, gross, net, w[4], q_excess, q_bench
+    # LL obs = 313 (features) + 10 (state) + 2 (HL action) = 325
+    portfolio_state_dim = 4 + core.n_assets + 2  # 4 scalars + n_assets + 2 quarterly
+    obs_dim_expected = core.feature_dim + portfolio_state_dim + 2
     print(f"\nObs space: {env.observation_space.shape}  (expected: ({obs_dim_expected},))")
     assert env.observation_space.shape == (obs_dim_expected,), (
         f"Obs dim mismatch: got {env.observation_space.shape}, "
@@ -76,10 +82,12 @@ def main():
     assert not np.any(np.isinf(obs)), "Reset obs has Inf"
 
     equity_curve = [core.equity]
+    bench_curve = [core.bench_equity]
     rewards = []
     grosses = []
     nets = []
-    drawdowns = []
+    excess_dds_short = []
+    quarterly_excess_history = []
     turnovers = []
 
     step = 0
@@ -88,7 +96,9 @@ def main():
         obs, reward, terminated, truncated, info = env.step(action)
         rewards.append(reward)
         equity_curve.append(info["equity"])
-        drawdowns.append(info["drawdown"])
+        bench_curve.append(info["bench_equity"])
+        excess_dds_short.append(info["excess_dd_short"])
+        quarterly_excess_history.append(info["quarterly_excess"])
         turnovers.append(info["turnover"])
         grosses.append(float(np.sum(np.abs(info["weights"]))))
         nets.append(float(np.sum(info["weights"])))
@@ -96,7 +106,9 @@ def main():
 
         # Step-level invariants
         assert info["equity"] > 0, f"Equity went non-positive at step {step}: {info['equity']}"
-        assert 0 <= info["drawdown"] <= 1, f"Drawdown OOB at step {step}: {info['drawdown']}"
+        assert -1.0 <= info["excess_dd_short"] <= 1.0, (
+            f"excess_dd_short OOB at step {step}: {info['excess_dd_short']}"
+        )
         assert grosses[-1] <= cfg.max_gross + 1e-5, (
             f"Gross leverage breach at step {step}: {grosses[-1]:.4f} > {cfg.max_gross}"
         )
@@ -115,35 +127,41 @@ def main():
     rewards = np.array(rewards)
     grosses = np.array(grosses)
     nets = np.array(nets)
-    drawdowns = np.array(drawdowns)
+    excess_dds_short = np.array(excess_dds_short)
+    quarterly_excess_history = np.array(quarterly_excess_history)
     turnovers = np.array(turnovers)
 
     print(f"\n--- Summary across the episode ---")
-    print(f"  Reward:    mean={rewards.mean():+.5f}  std={rewards.std():.5f}  "
+    print(f"  Reward:           mean={rewards.mean():+.5f}  std={rewards.std():.5f}  "
           f"min={rewards.min():+.5f}  max={rewards.max():+.5f}")
-    print(f"  Equity:    start={equity_curve[0]:.4f}  end={equity_curve[-1]:.4f}  "
+    print(f"  Equity:           start={equity_curve[0]:.4f}  end={equity_curve[-1]:.4f}  "
           f"max={max(equity_curve):.4f}  min={min(equity_curve):.4f}")
-    print(f"  Gross:     mean={grosses.mean():.3f}  max={grosses.max():.3f}  "
+    print(f"  Bench equity:     start={bench_curve[0]:.4f}  end={bench_curve[-1]:.4f}")
+    print(f"  Gross:            mean={grosses.mean():.3f}  max={grosses.max():.3f}  "
           f"(cap: {cfg.max_gross})")
-    print(f"  Net:       mean={nets.mean():+.3f}  min={nets.min():+.3f}  "
+    print(f"  Net:              mean={nets.mean():+.3f}  min={nets.min():+.3f}  "
           f"max={nets.max():+.3f}")
-    print(f"  Drawdown:  mean={drawdowns.mean():.3f}  max={drawdowns.max():.3f}")
-    print(f"  Turnover:  mean={turnovers.mean():.4f}  max={turnovers.max():.4f}")
+    print(f"  Excess_dd_short:  mean={excess_dds_short.mean():+.3f}  "
+          f"min={excess_dds_short.min():+.3f}  max={excess_dds_short.max():+.3f}")
+    print(f"  Quarterly excess: mean={quarterly_excess_history.mean():+.4f}  "
+          f"min={quarterly_excess_history.min():+.4f}  max={quarterly_excess_history.max():+.4f}")
+    print(f"  Turnover:         mean={turnovers.mean():.4f}  max={turnovers.max():.4f}")
 
     # ---------- Sanity sniff tests ----------
     print(f"\n--- Sanity sniff tests ---")
 
-    # Random actions should produce a wide spread of equity outcomes.
-    # If equity is suspiciously close to 1.0, something's not happening (env stuck).
     equity_change = abs(equity_curve[-1] / equity_curve[0] - 1.0)
-    print(f"  Equity moved {equity_change*100:.1f}% from start to end")
+    print(f"  Agent equity moved {equity_change*100:.1f}% from start to end")
+    bench_change = abs(bench_curve[-1] / bench_curve[0] - 1.0)
+    print(f"  Bench equity moved {bench_change*100:.1f}% from start to end")
     if equity_change < 0.01:
-        print(f"  ⚠ Episode ended within 1% of starting equity. Env may be stuck.")
+        print(f"  ⚠ Agent ended within 1% of starting equity. Env may be stuck.")
 
-    # Random actions should explore both signs of net exposure
+    # Confirm parallel benchmark equity tracking
+    print(f"  Final agent: {equity_curve[-1]:.4f}, final bench: {bench_curve[-1]:.4f}")
     print(f"  Net exposure crossed zero: {(np.diff(np.sign(nets)) != 0).any()}")
 
-    # Reset twice and confirm we get a different starting point (random reset works)
+    # Reset twice and confirm we get a different starting point
     core.reset(seed=0)
     t0 = core.t_start
     core.reset(seed=1)
