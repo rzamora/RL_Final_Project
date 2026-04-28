@@ -302,15 +302,42 @@ class PortfolioCore:
     # ------------------------------------------------------------------
 
     def apply_allocation(self, new_weights: np.ndarray) -> Tuple[float, bool, dict]:
+        """Apply the new allocation, realizing tomorrow's return on it.
+
+        Timing semantics (end-of-day rebalance):
+          - Agent observes features[t] at end of day t (includes today's return)
+          - Agent decides new_weights, the overnight position into day t+1
+          - PL is realized when day t+1 closes: weights * returns[t+1]
+        """
         old_weights = self.weights.copy()
         self.weights = new_weights.astype(np.float32)
 
-        # Realize portfolio and benchmark returns for this step
-        asset_returns = self.returns[self.t]
-        portfolio_return = float(np.dot(self.weights, asset_returns))
-        bench_return = float(self.benchmark_returns[self.t])
+        # CRITICAL: use NEXT day's return — the return realized on the position
+        # the agent just took, not today's already-known return.
+        next_t = self.t + 1
+        if next_t >= len(self.returns):
+            # End of data — terminate immediately, no return realized this step
+            info = {
+                "equity": self.equity,
+                "bench_equity": self.bench_equity,
+                "excess_dd_short": self.excess_dd_short,
+                "excess_dd_long": self.excess_dd_long,
+                "agent_dd_short": 0.0,
+                "bench_dd_short": 0.0,
+                "weights": self.weights.copy(),
+                "turnover": float(np.sum(np.abs(self.weights - old_weights))),
+                "portfolio_return": 0.0,
+                "benchmark_return": 0.0,
+                "quarterly_excess": self.quarterly_excess,
+                "quarterly_bench": self.quarterly_bench,
+            }
+            self.t = next_t  # advance for consistency
+            return 0.0, True, info
 
-        # Update equity curves in parallel
+        asset_returns = self.returns[next_t]
+        portfolio_return = float(np.dot(self.weights, asset_returns))
+        bench_return = float(self.benchmark_returns[next_t])
+
         self.equity *= 1.0 + portfolio_return
         self.bench_equity *= 1.0 + bench_return
 
@@ -331,9 +358,6 @@ class PortfolioCore:
         bench_dd_short = 1.0 - self.bench_equity / bench_peak_short
         bench_dd_long = 1.0 - self.bench_equity / bench_peak_long
 
-        # Excess drawdown (the agent's idiosyncratic underwater-ness)
-        # > 0 means agent is in deeper drawdown than benchmark (bad)
-        # ≤ 0 means agent is doing better than benchmark in dd terms (fine)
         self.excess_dd_short = agent_dd_short - bench_dd_short
         self.excess_dd_long = agent_dd_long - bench_dd_long
 
@@ -367,7 +391,6 @@ class PortfolioCore:
             "quarterly_bench": self.quarterly_bench,
         }
         return reward, done, info
-
     def _reward(self, portfolio_return: float, turnover: float) -> float:
         # 1. Log growth — direct reward for absolute returns
         r = max(portfolio_return, -0.999)
