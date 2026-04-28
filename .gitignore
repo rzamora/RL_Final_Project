@@ -1,4 +1,45 @@
-data/synthetic/pool_checkpoints/checkpoint_seed42_paths02000.npz
-data/synthetic/pool_checkpoints/checkpoint_seed43_paths02000.npz
-data/synthetic/pools/synthetic_pool_production_n2000_seed42.npz
-data/synthetic/pools/synthetic_pool_production_n2000_seed43.npz
+# ============================================================
+# Project-specific
+# ============================================================
+
+# Large data files - originals stay local, working copies in Dropbox
+data/
+
+# Training outputs
+checkpoints/
+tb_logs/
+
+# Archive of original/legacy artifacts (your call — comment out if you want
+# to commit these as a baseline reference)
+archive/
+
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env_backup/
+
+# ============================================================
+# IDE / editor
+# ============================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ============================================================
+# OS
+# ============================================================
+.DS_Store
+._*
+Thumbs.db
