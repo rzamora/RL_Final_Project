@@ -446,9 +446,48 @@ These distributions are high-quality.
 4. ✅ TLT vs. equity asymmetry confirms Kronos struggles more with bonds (correct empirical finding)
 
 
+### Test Period Regime Distribution (2023-04 → 2026-04)
 
+#### Distribution Summary
 
+| Regime | Test % | Training % | What it means |
+|--------|--------|------------|---------------|
+| Bull | 30.9% | 39.2% | A bit less Bull than long-term average — moderate risk-on environment |
+| Bear | 30.5% | 37.7% | Comparable to historical Bear share |
+| SevereBear | 37.8% | 16.4% | **2.3× higher than training** — periods of elevated volatility were common |
+| Crisis | 0.8% | 6.8% | Almost no true crisis days |
 
+#### Economic Interpretation
+
+The distribution is a plausible reading of 2023-2026:
+
+- **The Bull share (30.9%)** captures the AI / Mag-7 rally periods (mid-2023, late-2024).
+- **The SevereBear share (37.8%)** captures the high-volatility-without-true-meltdown regime that dominated post-2022. Rate-cycle turbulence: VIX in the 17-25 range much of the time, big intraday swings, but no sustained 20%+ drawdown.
+- **The low Crisis share (0.8%)** is correct — there was no true Lehman/COVID-style crisis in 2023-2026. Even the regional bank scare in March 2023 and the August 2024 yen-carry unwind only briefly hit Crisis-level volatility.
+- **Bear (30.5%)** captures the choppy correction periods (Q3 2023, early 2024 corrections, summer 2024).
+
+#### Implications for the Agent
+
+The agent will see **predominantly SevereBear** market conditions during testing, even though that regime was only 16.4% of training data. Two implications follow: The regime classifier correctly identifies that 2023-2026 was structurally different from 2004-2022 — more volatile-without-crisis. The agent gets accurate context about what kind of market it's in.  
+
+The agent's policy in SevereBear was learned from a **smaller sample of training data** (only 779 SevereBear days in training) than its Bull/Bear policies. There's a risk that policy decisions in SevereBear are less well-calibrated. If at test time the agent underperforms specifically in SevereBear days, that is the likely cause — and it's a justification for synthetic data training (the synthetic generator can produce more SevereBear paths than the real data has).
+
+#### Validation: April 2025 Tariff Episode
+
+The April 2025 tariff announcement period was a textbook SevereBear regime — sharp moves, elevated VIX (briefly hit ~50 around April 7-8), but market structure didn't fully break down into a sustained Crisis regime because the Fed didn't have to intervene and credit markets stayed functional.
+
+The HMM correctly classifies that period as a short-lived high-volatility selloff with policy uncertainty, not Lehman-scale systemic stress. The fact that Crisis only fires 0.8% of the time on the test set says: "yes, there were turbulent periods, but no true tail-risk crisis events that required emergency action." That matches reality.
+
+#### Why This Matters
+
+This is useful validation that the regime classifier is **economically calibrated**, not just statistically fitted. It distinguishes between:
+
+- **SevereBear**: high vol, big drawdowns, but functional markets (April 2025 tariffs, August 2024 yen carry, March 2023 SVB)
+- **Crisis**: vol explodes, correlations break down, hedges fail, central banks step in (2008 Lehman, 2020 COVID, late-2022 inflation panic)
+
+The agent trained on this data will learn that these regimes are different — and policy responses can differ. SevereBear might call for reduced gross exposure but maintained allocations. Crisis might call for full deleveraging and TLT skepticism (since TLT also broke down in 2022).
+
+This is exactly the kind of regime-aware behavior the project is designed to capture.
 
 
 
