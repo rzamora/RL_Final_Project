@@ -65,10 +65,16 @@ def process_raw_df(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray
 
 
 def load_synthetic_pool(npz_path: str, drop_close_features: bool = True) -> dict:
-    """Load synthetic pool, optionally stripping *_close features (recommended)."""
+    """Load synthetic pool, optionally stripping *_close features (recommended).
+
+    NOTE: synth_pool.npz stores returns in percent units (e.g. 1.27 = +1.27%),
+    while the real CSVs produce fractional returns via pct_change() (e.g.
+    0.0127 = +1.27%). PortfolioCore expects fractional. We rescale here so
+    both data sources reach the env in the same units.
+    """
     data = np.load(npz_path, allow_pickle=True)
     features = data["features"]
-    returns = data["returns"]
+    returns = data["returns"].astype(np.float32) / 100.0
     feature_names = list(data["feature_names"]) if "feature_names" in data.files else None
 
     prices = None
