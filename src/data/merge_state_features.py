@@ -256,6 +256,7 @@ def predict_test_regime_probs(test, train):
         saved = pickle.load(f)
     model = saved['hmm']
     feature_window = saved['feature_window']
+    state_order = saved['state_order']  # e.g. [2, 0, 3, 1] meaning raw state 2 = canonical Bull
     label_map = saved['regime_label_map']
 
     warmup = train.iloc[-feature_window:]  # last 21 trading days of train
@@ -281,30 +282,92 @@ def predict_test_regime_probs(test, train):
     test_features_valid = test_features[valid_mask].values
     print(f'Number of valid test features: {len(test_features_valid)} vs {len(test_features)}')
 
-    # Predict regime probabilities on test data this is online
+    # -------------------------------------------------------------------------
+    # Predict regime probabilities on test data — strictly causal (filtered)
+    # -------------------------------------------------------------------------
+    # At each step t, we call predict_proba on the truncated history [:t+1] and
+    # take only the last row. Because there is nothing past index t in the
+    # truncated sequence, hmmlearn's backward pass is a no-op at the boundary
+    # and the smoothed posterior gamma_t collapses to the filtered posterior:
+    #       P(state_t | x_1, ..., x_t)
+    # This is the strictly causal quantity an online RL agent could observe at
+    # decision time t — no future information leaks into earlier labels.
+    #
+    # The loop is O(n^2) but n=829 here and total runtime is a few seconds.
+    # An O(n) equivalent is available via hmmlearn's internal forward pass
+    # (_compute_log_likelihood + _do_forward_pass) but the public API is more
+    # stable and the numerical output is identical.
     probs_online = []
     for t in range(len(test_features_valid)):
-        history = test_features_valid[:t+1]
+        history = test_features_valid[:t + 1]
         probs_history = model.predict_proba(history)
-        probs_online.append(probs_history[-1]) #last row only
+        probs_online.append(probs_history[-1])  # filtered posterior at time t
     probs_online = np.array(probs_online)
 
     if len(probs_online) != len(test):
-        print(f"ERROR: probs_online length {len(probs_online)} does not equal len(test) {len(test)}")
-        print(f"Cannot save probs_online because it is not the same length as test")
-    else:
-        prob_columns = ['regime_prob_Bull', 'regime_prob_Bear', 'regime_prob_SevereBear', 'regime_prob_Crisis']
-        test_regime_probs = probs_online
-        test[prob_columns] = test_regime_probs
+        raise RuntimeError(
+            f"probs_online length {len(probs_online)} does not equal len(test) "
+            f"{len(test)}. Cannot align regime probabilities to test rows."
+        )
 
-    # Step 2: Compute hard labels from the reordered probs (or via label_map applied to raw seq — same result)
-    test_regime_seq = np.argmax(test_regime_probs, axis=1)
+    # -------------------------------------------------------------------------
+    # CRITICAL: Reorder raw HMM state columns -> canonical {Bull, Bear, SB, Crisis}
+    # -------------------------------------------------------------------------
+    # `model.predict_proba` returns columns indexed by raw HMM state (arbitrary,
+    # determined by EM init). The canonical order [Bull, Bear, SevereBear, Crisis]
+    # was established at fit time by classify_regime_labels() and stored in the
+    # `state_order` array: state_order[c] is the raw HMM state index that
+    # corresponds to canonical class c.
+    #
+    # This reorder was applied to the train probs at fit time (see
+    # fit_hmm_regimes -> canon_probs_short = raw_probs_short[:, order]) but was
+    # previously omitted on test, so test labels were a permutation of the
+    # canonical names. That permutation explains the train/test inversion seen
+    # in the regime classifier diagnostic.
+    #
+    # Requires fit_hmm_regimes() to save 'state_order' into the pickle. See the
+    # matching patch in regime_dcc_garch_copula_V1.py.
+    state_order = saved.get('state_order')
+    if state_order is None:
+        raise KeyError(
+            "Pickle missing 'state_order' — cannot map raw HMM states to canonical "
+            "regime names. Re-fit the HMM with fit_hmm_regimes() updated to save "
+            "'state_order' alongside 'hmm' and 'regime_label_map'."
+        )
+
+    probs_canonical = probs_online[:, state_order]
+
+    # Sanity: rows should still sum to 1 (reordering is a column permutation)
+    row_sums = probs_canonical.sum(axis=1)
+    if not np.allclose(row_sums, 1.0, atol=1e-6):
+        raise ValueError(
+            f"Canonical probs do not sum to 1 (range: {row_sums.min():.6f} - "
+            f"{row_sums.max():.6f}). Likely an issue with state_order."
+        )
+
+    # -------------------------------------------------------------------------
+    # Write canonical-order probs into the test DataFrame
+    # -------------------------------------------------------------------------
+    prob_columns = ['regime_prob_Bull', 'regime_prob_Bear',
+                    'regime_prob_SevereBear', 'regime_prob_Crisis']
+    test[prob_columns] = probs_canonical
+
+    # -------------------------------------------------------------------------
+    # Diagnostics
+    # -------------------------------------------------------------------------
+    test_regime_seq = np.argmax(probs_canonical, axis=1)
     regime_names = ['Bull', 'Bear', 'SevereBear', 'Crisis']
-    unique, counts = np.unique(test_regime_seq, return_counts=True)
-    total = counts.sum()
-    print("Test regime distribution:")
-    for u, c in zip(unique, counts):
-        print(f"  {regime_names[u]}: {c / total:.3f}")
+
+    print("\nRaw HMM state -> canonical regime mapping (from training):")
+    for canon_idx, raw_idx in enumerate(state_order):
+        print(f"  raw HMM state {raw_idx}  ->  canonical {canon_idx} ({regime_names[canon_idx]})")
+
+    print("\nTest regime distribution (canonical labels, filtered/causal):")
+    seen = dict(zip(*np.unique(test_regime_seq, return_counts=True)))
+    total = len(test_regime_seq)
+    for c, name in enumerate(regime_names):
+        n = int(seen.get(c, 0))
+        print(f"  {name:<12s}  {n:>4d} days  ({n / total * 100:>5.1f}%)")
 
     print("Saving the test file with regime probabilities...")
     test.to_csv(DATA_MERGED / 'test' / 'RL_Final_Merged_test.csv', index=True)

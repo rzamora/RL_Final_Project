@@ -513,6 +513,7 @@ def fit_hmm_regimes(returns, n_regimes=N_REGIMES, feature_window=21):
             'hmm': model,
             'feature_window': 21,  # the window you used for make_regime_features
             'regime_label_map': REGIME_NAMES,  # mapping from raw HMM states to canonical 0=Bull..3=Crisis
+            'state_order':order,
         }, f)
 
     return regime_seq, regime_probs, model, trans_sorted
@@ -566,7 +567,8 @@ def fit_dcc_single(std_resids):
             if sign <= 0:
                 return 1e10
             zt = Z[t].reshape(-1, 1)
-            ll += -0.5 * (ldet + float(zt.T @ np.linalg.inv(Rt) @ zt))
+            quad = zt.T @ np.linalg.inv(Rt) @ zt  # shape (1, 1)
+            ll += -0.5 * (ldet + quad.item())      # .item() works for any size-1 array, NumPy 1.x and 2.x
         return -ll
 
     res = minimize(
