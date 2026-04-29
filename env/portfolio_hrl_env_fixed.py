@@ -141,10 +141,10 @@ class CoreConfig:
     # Mild weight (0.3) on regime-incorrect outcomes:
     #   - Outperforming in a rally (alpha is nice but not required)
     #   - Underperforming in a selloff (forgivable, world is bad)
-    lambda_upside_miss:     float = 1.5
-    lambda_upside_beat:     float = 0.3
-    lambda_downside_excess: float = 0.3
-    lambda_crisis_alpha:    float = 1.5
+    lambda_upside_miss: float = 0.5
+    lambda_upside_beat: float = 0.1
+    lambda_downside_excess: float = 0.1
+    lambda_crisis_alpha: float = 0.5
 
 
 # ============================================================

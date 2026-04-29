@@ -2,8 +2,5 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/../Base-Classes" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/../DownloadIB_TWS_V10" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/../Mag7" vcs="Git" />
   </component>
 </project>
