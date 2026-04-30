@@ -45,45 +45,42 @@ PRETRAIN_DIR = PATHS.checkpoints / "hl_synth_pretrain_no_regime_dd10"
 FT_DIR = PATHS.checkpoints / "hl_finetune_real_no_regime_dd10"
 
 HL_CHECKPOINTS = [
-    # Synth pretrain endpoints — same checkpoint frequencies as standard
+    # Synth pretrain endpoints
     (
         "hl_dd10_pretrain_100k",
-        PRETRAIN_DIR / "ppo_hl_no_regime_dd10_100000_steps.zip",
-        PRETRAIN_DIR / "ppo_hl_no_regime_dd10_vecnormalize_100000_steps.pkl",
+        PRETRAIN_DIR / "ppo_hl_no_regime_100000_steps.zip",
+        PRETRAIN_DIR / "ppo_hl_no_regime_vecnormalize_100000_steps.pkl",
     ),
     (
         "hl_dd10_pretrain_200k",
-        PRETRAIN_DIR / "ppo_hl_no_regime_dd10_200000_steps.zip",
-        PRETRAIN_DIR / "ppo_hl_no_regime_dd10_vecnormalize_200000_steps.pkl",
+        PRETRAIN_DIR / "ppo_hl_no_regime_200000_steps.zip",
+        PRETRAIN_DIR / "ppo_hl_no_regime_vecnormalize_200000_steps.pkl",
     ),
     (
         "hl_dd10_pretrain_best_test",
         PRETRAIN_DIR / "best_on_real_test" / "best_model.zip",
-        # Vecnorm pairing: defaults to 200k since EvalCallback usually picks
-        # an early checkpoint. If "best_test" is from a different step, you'll
-        # see it in the eval output and can swap.
-        PRETRAIN_DIR / "ppo_hl_no_regime_dd10_vecnormalize_200000_steps.pkl",
+        PRETRAIN_DIR / "ppo_hl_no_regime_vecnormalize_200000_steps.pkl",
     ),
     (
         "hl_dd10_pretrain_final",
-        PRETRAIN_DIR / "hl_no_regime_dd10_final.zip",
-        PRETRAIN_DIR / "hl_no_regime_dd10_final_vecnorm.pkl",
+        PRETRAIN_DIR / "hl_no_regime_final.zip",
+        PRETRAIN_DIR / "hl_no_regime_final_vecnorm.pkl",
     ),
     # Fine-tune endpoints
     (
         "hl_dd10_ft_best_test",
         FT_DIR / "best_on_real_test" / "best_model.zip",
-        FT_DIR / "ppo_hl_ft_no_regime_dd10_vecnormalize_200000_steps.pkl",
+        FT_DIR / "ppo_hl_ft_no_regime_vecnormalize_200000_steps.pkl",
     ),
     (
         "hl_dd10_ft_best_train",
         FT_DIR / "best_on_real_train" / "best_model.zip",
-        FT_DIR / "ppo_hl_ft_no_regime_dd10_vecnormalize_200000_steps.pkl",
+        FT_DIR / "ppo_hl_ft_no_regime_vecnormalize_200000_steps.pkl",
     ),
     (
         "hl_dd10_ft_final",
-        FT_DIR / "hl_ft_no_regime_dd10_final.zip",
-        FT_DIR / "hl_ft_no_regime_dd10_final_vecnorm.pkl",
+        FT_DIR / "hl_ft_no_regime_final.zip",
+        FT_DIR / "hl_ft_no_regime_final_vecnorm.pkl",
     ),
 ]
 
