@@ -27,11 +27,17 @@ CORRECTIONS vs original draft:
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import sys
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from project_config import PATHS
+
+TRAIN_CSV = Path(PATHS.train_csv)
+TEST_CSV = Path(PATHS.test_csv)
 
 # ---- Paths (replaces project_config.PATHS) -----------------------------------
-TRAIN_CSV = Path("/mnt/user-data/uploads/RL_Final_Merged_train.csv")
-TEST_CSV  = Path("/mnt/user-data/uploads/RL_Final_Merged_test.csv")
 
 # ---- Schema constants --------------------------------------------------------
 REGIME_NAMES = ["Bull", "Bear", "SevereBear", "Crisis"]

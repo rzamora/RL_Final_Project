@@ -1,15 +1,8 @@
 """
-eval/eval_hl_v2.py
+eval/eval_hl_no_regime.py
 
-Evaluates the HL v2 checkpoint (frozen LL = ll_random_hl_finetune) on real
-test using portfolio metrics. Compares against:
-  - HL v1 (frozen LL = light_100k, regime-blind LL underneath)
-  - LL-only baselines (light_100k, synth_600k)
-  - Random baseline
-
-Headline question: does adding the v2 HL on top of the random-HL LL beat
-the LL alone? If yes, the hierarchy added value despite the SB-Bull
-posture gap not converging. If no, we proceed to step 2 (regime-bucket LL).
+Evaluates the no-regime HL stack (HL on top of no-regime fine-tuned LL)
+with portfolio metrics. Compares against the full project leaderboard.
 """
 
 import sys
@@ -26,7 +19,9 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from project_config import PATHS
-from env.portfolio_hrl_env_fixed import (
+
+# CRITICAL: import from no_regime env
+from env.portfolio_hrl_env_no_regime import (
     CoreConfig,
     HighLevelPortfolioEnv,
     PortfolioCore,
@@ -41,28 +36,56 @@ from portfolio_stats import compute_stats
 # Paths
 # ---------------------------------------------------------------------------
 
-# Frozen LL — random-HL fine-tuned (used by v2)
-LL_MODEL = (PATHS.checkpoints / "ll_random_hl_finetune"
-            / "ll_random_hl_ft_final.zip")
-LL_VECNORM = (PATHS.checkpoints / "ll_random_hl_finetune"
-              / "ll_random_hl_ft_final_vecnorm.pkl")
+LL_MODEL = (PATHS.checkpoints / "ll_finetune_real_no_regime"
+            / "ll_ft_no_regime_final.zip")
+LL_VECNORM = (PATHS.checkpoints / "ll_finetune_real_no_regime"
+              / "ll_ft_no_regime_final_vecnorm.pkl")
 
-HL_V2_DIR = PATHS.checkpoints / "hl_synth_pretrain_v2"
+PRETRAIN_DIR = PATHS.checkpoints / "hl_synth_pretrain_no_regime"
+FT_DIR = PATHS.checkpoints / "hl_finetune_real_no_regime"
 
-# Best on real_test in v2 was step 900000 (eval reward -2.). Best on
-# real_train was step 700000 (eval reward -4.01). Final at 1M.
-HL_V2_CHECKPOINTS = [
+# (label, model_path, vecnorm_path)
+HL_CHECKPOINTS = [
+    # Synth pretrain endpoints
     (
-        "hl_v2_900k_best_test",
-        HL_V2_DIR / "best_on_real_test" / "best_model.zip",
-        HL_V2_DIR / "ppo_hl_v2_vecnormalize_900000_steps.pkl",
+        "hl_no_regime_pretrain_best_test",
+        PRETRAIN_DIR / "best_on_real_test" / "best_model.zip",
+        PRETRAIN_DIR / "ppo_hl_no_regime_vecnormalize_200000_steps.pkl",
     ),
     (
-        "hl_v2_1M_final",
-        HL_V2_DIR / "hl_v2_final.zip",
-        HL_V2_DIR / "hl_v2_final_vecnorm.pkl",
+        "hl_no_regime_pretrain_700k_best_test_late",
+        PRETRAIN_DIR / "ppo_hl_no_regime_700000_steps.zip",
+        PRETRAIN_DIR / "ppo_hl_no_regime_vecnormalize_700000_steps.pkl",
+    ),
+    (
+        "hl_no_regime_pretrain_final",
+        PRETRAIN_DIR / "hl_no_regime_final.zip",
+        PRETRAIN_DIR / "hl_no_regime_final_vecnorm.pkl",
+    ),
+    # Fine-tune endpoints
+    (
+        "hl_no_regime_ft_best_test",
+        FT_DIR / "best_on_real_test" / "best_model.zip",
+        FT_DIR / "ppo_hl_ft_no_regime_vecnormalize_200000_steps.pkl",
+    ),
+    (
+        "hl_no_regime_ft_best_train",
+        FT_DIR / "best_on_real_train" / "best_model.zip",
+        FT_DIR / "ppo_hl_ft_no_regime_vecnormalize_200000_steps.pkl",
+    ),
+    (
+        "hl_no_regime_ft_final",
+        FT_DIR / "hl_ft_no_regime_final.zip",
+        FT_DIR / "hl_ft_no_regime_final_vecnorm.pkl",
     ),
 ]
+
+HL_CHECKPOINTS.insert(1, (
+    "hl_no_regime_pretrain_100k",
+    PRETRAIN_DIR / "ppo_hl_no_regime_100000_steps.zip",
+    PRETRAIN_DIR / "ppo_hl_no_regime_vecnormalize_100000_steps.pkl",
+))
+
 
 N_SEEDS = 10
 REAL_EPISODE_LENGTH = 384
@@ -92,8 +115,6 @@ class _DummyObsEnv(gym.Env):
 
 
 def load_frozen_ll():
-    """Load random-HL LL. NO Fix A patch (LL trained with random HL, stats
-    are already meaningful)."""
     ll_model = PPO.load(str(LL_MODEL), device="cpu")
     dummy_env = DummyVecEnv([lambda: _DummyObsEnv(ll_model.observation_space.shape[0])])
     ll_vecnorm = VecNormalize.load(str(LL_VECNORM), dummy_env)
@@ -115,7 +136,7 @@ class FrozenLLAdapter:
 
 
 # ---------------------------------------------------------------------------
-# HL episode runner
+# Episode runner
 # ---------------------------------------------------------------------------
 
 def run_hl_episode(hl_model, hl_vecnorm_path, env_factory):
@@ -158,6 +179,10 @@ def run_hl_episode(hl_model, hl_vecnorm_path, env_factory):
     }
 
 
+# ---------------------------------------------------------------------------
+# Env factories
+# ---------------------------------------------------------------------------
+
 def make_real_hl_env_factory(features, returns, ll_adapter, seed):
     def _init():
         cfg = CoreConfig(episode_length=REAL_EPISODE_LENGTH)
@@ -171,7 +196,7 @@ def make_synth_hl_env_factory(pool, ll_adapter, seed):
     def _init():
         cfg = CoreConfig(episode_length=SYNTH_EPISODE_LENGTH)
         sampler = SyntheticPoolCoreSampler(pool=pool, cfg=cfg,
-                                            rng=np.random.default_rng(seed))
+                                              rng=np.random.default_rng(seed))
         return HighLevelPortfolioEnv(sampler, ll_adapter)
     return _init
 
@@ -187,8 +212,8 @@ def aggregate(per_seed):
 
 def print_header():
     cols = ["eq", "alpha", "sharpe", "sortino", "calmar", "max_dd", "hit", "reward"]
-    print(f"  {'label @ dataset':<32s}" + "".join(f"  {c:>7s}" for c in cols))
-    print("  " + "-" * 32 + "".join(f"  {'-'*7}" for _ in cols))
+    print(f"  {'label @ dataset':<46s}" + "".join(f"  {c:>7s}" for c in cols))
+    print("  " + "-" * 46 + "".join(f"  {'-'*7}" for _ in cols))
 
 
 def print_row(label, m):
@@ -202,7 +227,7 @@ def print_row(label, m):
         ("hit_rate",     7, 3, ""),
         ("total_reward", 7, 1, "+"),
     ]
-    s = f"  {label:<32s}"
+    s = f"  {label:<46s}"
     for key, w, d, sign in cols:
         s += f"  {m[key]:>{sign}{w}.{d}f}"
     print(s)
@@ -213,25 +238,37 @@ def print_row(label, m):
 # ---------------------------------------------------------------------------
 
 def main():
-    print("=" * 88)
-    print("HL v2 evaluation (frozen LL = ll_random_hl_finetune)")
-    print("=" * 88)
+    print("=" * 110)
+    print("HL NO-REGIME evaluation — full HRL stack with no regime probs")
+    print("=" * 110)
+    print()
+    print("This evaluates the final piece of the no-regime experiment:")
+    print("  - LL was retrained without regime probs (309 features instead of 313)")
+    print("  - HL pretrained on top of fine-tuned no-regime LL")
+    print("  - HL fine-tuned on real_train")
+    print()
+    print("Best LL alone (no-regime): eq=1.524, Sharpe=+1.13, max_dd=0.314")
+    print("Question: does the HL stack improve on this LL alone?")
+    print()
 
     # Verify
-    print("\nVerifying checkpoint files...")
-    for label, model_p, vecnorm_p in HL_V2_CHECKPOINTS:
+    print("Verifying checkpoint files...")
+    valid = []
+    for label, model_p, vecnorm_p in HL_CHECKPOINTS:
         m_ok = model_p.exists()
         v_ok = vecnorm_p.exists()
         flag = "OK " if (m_ok and v_ok) else "MISSING"
         print(f"  [{flag}] {label}")
         if not m_ok: print(f"          model:    {model_p}")
         if not v_ok: print(f"          vecnorm:  {vecnorm_p}")
+        if m_ok and v_ok:
+            valid.append((label, model_p, vecnorm_p))
+
     if not LL_MODEL.exists() or not LL_VECNORM.exists():
-        print(f"  [MISSING] frozen LL")
+        print(f"\n[MISSING] frozen LL")
         sys.exit(1)
-    valid = [c for c in HL_V2_CHECKPOINTS if c[1].exists() and c[2].exists()]
     if not valid:
-        print("\nNo valid HL v2 checkpoints. Aborting.")
+        print("\nNo valid checkpoints. Aborting.")
         sys.exit(1)
 
     # Datasets
@@ -241,28 +278,33 @@ def main():
     feats_train, rets_train, _ = process_raw_df(train_df)
     feats_test, rets_test, _ = process_raw_df(test_df)
     pool = load_synthetic_pool(PATHS.synth_pool)
+    print(f"  train: {feats_train.shape}, test: {feats_test.shape}")
+    print(f"  synth: {pool['features'].shape}")
 
     # Frozen LL
-    print("\nLoading frozen LL (random-HL fine-tuned)...")
+    print("Loading frozen LL (no-regime fine-tuned)...")
     ll_predict_fn = load_frozen_ll()
     ll_adapter = FrozenLLAdapter(ll_predict_fn)
 
-    # Eval each HL v2 checkpoint
+    # Eval each checkpoint
     all_results = {}
     for ckpt_label, model_path, vecnorm_path in valid:
         print()
-        print("=" * 88)
+        print("=" * 110)
         print(f"HL CHECKPOINT: {ckpt_label}")
         print(f"  model:   {model_path.name}")
         print(f"  vecnorm: {vecnorm_path.name}")
-        print("=" * 88)
+        print("=" * 110)
 
         hl_model = PPO.load(str(model_path), device="cpu")
         ds_results = {}
         for ds_name, factory_builder in [
-            ("real_train", lambda s: make_real_hl_env_factory(feats_train, rets_train, ll_adapter, s)),
-            ("real_test",  lambda s: make_real_hl_env_factory(feats_test, rets_test, ll_adapter, s)),
-            ("synth",      lambda s: make_synth_hl_env_factory(pool, ll_adapter, s + 9000)),
+            ("real_train",
+             lambda s: make_real_hl_env_factory(feats_train, rets_train, ll_adapter, s)),
+            ("real_test",
+             lambda s: make_real_hl_env_factory(feats_test, rets_test, ll_adapter, s)),
+            ("synth",
+             lambda s: make_synth_hl_env_factory(pool, ll_adapter, s + 9000)),
         ]:
             per_seed = []
             for seed in range(N_SEEDS):
@@ -275,27 +317,42 @@ def main():
             print_row(f"{ckpt_label} @ {ds}", ds_results[ds])
         all_results[ckpt_label] = ds_results
 
-    # Headline real_test
+    # Headline
     print()
-    print("=" * 88)
-    print("HEADLINE: real_test — HL v2 vs HL v1 vs LL-only baselines vs random")
-    print("=" * 88)
+    print("=" * 110)
+    print("HEADLINE: real_test — no-regime HL vs full leaderboard")
+    print("=" * 110)
     print()
     print("Reference numbers (from previous evals):")
-    print("  random              @ real_test   eq=1.124  alpha=-0.577  sharpe=+0.45  max_dd=0.232")
-    print("  synth_600k_LL       @ real_test   eq=1.434  alpha=-0.263  sharpe=+1.61  max_dd=0.110")
-    print("  light_100k_LL       @ real_test   eq=1.531  alpha=-0.172  sharpe=+1.87  max_dd=0.112")
-    print("  hl_v1_300k_best_test@ real_test   eq=1.223  alpha=-0.478  sharpe=+1.60  max_dd=0.053")
-    print("  hl_v1_1M_final      @ real_test   eq=1.059  alpha=-0.650  sharpe=+0.35  max_dd=0.097")
+    print(f"  {'random':<42s}  eq=1.124  alpha=-0.577  sharpe=+0.45  max_dd=0.232")
+    print(f"  {'synth_600k_LL (with regime probs)':<42s}  eq=1.434  alpha=-0.263  sharpe=+1.61  max_dd=0.110")
+    print(f"  {'light_100k_LL (with regime probs, BEST)':<42s}  eq=1.531  alpha=-0.172  sharpe=+1.87  max_dd=0.112")
+    print(f"  {'no-regime LL alone (best, ft_best_train)':<42s}  eq=1.524  alpha=-0.200  sharpe=+1.13  max_dd=0.314")
+    print(f"  {'hl_v2_250k_best_test (with regime probs)':<42s}  eq=1.095  alpha=-0.600  sharpe=+0.46  max_dd=0.103")
+    print(f"  {'hl_ft_uc_best_train (with regime, BEST HRL)':<42s}  eq=1.165  alpha=-0.521  sharpe=+0.51  max_dd=0.240")
     print()
     print_header()
     for ckpt_label, ds_results in all_results.items():
         print_row(f"{ckpt_label} @ real_test", ds_results["real_test"])
 
+    # Train-test gap
     print()
-    print("=" * 88)
+    print("=" * 110)
+    print("TRAIN-TEST GAP ANALYSIS")
+    print("=" * 110)
+    print()
+    print(f"  {'checkpoint':<46s}  {'train_eq':>10s}  {'test_eq':>10s}  {'gap':>10s}")
+    print(f"  {'-'*46}  {'-'*10}  {'-'*10}  {'-'*10}")
+    for ckpt_label, ds_results in all_results.items():
+        train_eq = ds_results["real_train"]["final_equity"]
+        test_eq = ds_results["real_test"]["final_equity"]
+        gap = train_eq - test_eq
+        print(f"  {ckpt_label:<46s}  {train_eq:>10.3f}  {test_eq:>10.3f}  {gap:>+10.3f}")
+
+    print()
+    print("=" * 110)
     print("Done.")
-    print("=" * 88)
+    print("=" * 110)
 
 
 if __name__ == "__main__":

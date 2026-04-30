@@ -65,7 +65,7 @@ PPO_OVERRIDES = dict(
     learning_rate=3e-5,
     n_epochs=4,
     clip_range=0.1,
-    ent_coef=0.01,
+    ent_coef=0.05, # ====> 5
 )
 
 

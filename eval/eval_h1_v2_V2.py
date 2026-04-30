@@ -49,13 +49,13 @@ LL_VECNORM = (PATHS.checkpoints / "ll_random_hl_finetune"
 
 HL_V2_DIR = PATHS.checkpoints / "hl_synth_pretrain_v2"
 
-# Best on real_test in v2 was step 900000 (eval reward -2.). Best on
-# real_train was step 700000 (eval reward -4.01). Final at 1M.
+# Best on real_test in v2 was step 250000 (eval reward -16,05). Best on
+# real_train was step 200000 (eval reward -2.05). Final at 1M.
 HL_V2_CHECKPOINTS = [
     (
-        "hl_v2_900k_best_test",
+        "hl_v2_250k_best_test",
         HL_V2_DIR / "best_on_real_test" / "best_model.zip",
-        HL_V2_DIR / "ppo_hl_v2_vecnormalize_900000_steps.pkl",
+        HL_V2_DIR / "ppo_hl_v2_vecnormalize_300000_steps.pkl",
     ),
     (
         "hl_v2_1M_final",

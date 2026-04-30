@@ -1,15 +1,17 @@
 """
-eval/eval_hl_v2.py
+eval/eval_hl_V2_finetuneHL.py
 
-Evaluates the HL v2 checkpoint (frozen LL = ll_random_hl_finetune) on real
-test using portfolio metrics. Compares against:
-  - HL v1 (frozen LL = light_100k, regime-blind LL underneath)
-  - LL-only baselines (light_100k, synth_600k)
-  - Random baseline
+Evaluates the HL real-data fine-tune checkpoints with portfolio metrics.
+Two fine-tune runs are evaluated:
+  - hl_finetune_real_unconstrained (started from hl_v2_final, gross unconstrained)
+  - hl_finetune_real_constrained_gross (started from hl_v2_cg_final, gross [0.8, 1.0])
 
-Headline question: does adding the v2 HL on top of the random-HL LL beat
-the LL alone? If yes, the hierarchy added value despite the SB-Bull
-posture gap not converging. If no, we proceed to step 2 (regime-bucket LL).
+For each run, three checkpoints are evaluated:
+  - best_on_real_test (likely 100k by reward — least overfit point)
+  - best_on_real_train (likely 200k by reward — most overfit point)
+  - final 200k
+
+Reference baselines printed alongside for the writeup.
 """
 
 import sys
@@ -26,14 +28,26 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from project_config import PATHS
+
+# IMPORTANT: import the env class for each variant from the right module.
+# Unconstrained uses portfolio_hrl_env_fixed; constrained-gross uses
+# portfolio_hrl_env_constrained_gross. They have different parse_hl_action
+# implementations, so loading the wrong env class would give wrong results.
 from env.portfolio_hrl_env_fixed import (
-    CoreConfig,
-    HighLevelPortfolioEnv,
-    PortfolioCore,
-    SyntheticPoolCoreSampler,
+    CoreConfig as CoreConfigUC,
+    HighLevelPortfolioEnv as HLEnvUC,
+    PortfolioCore as PortfolioCoreUC,
+    SyntheticPoolCoreSampler as SamplerUC,
     load_synthetic_pool,
     process_raw_df,
 )
+from env.portfolio_hrl_env_constrained_gross import (
+    CoreConfig as CoreConfigCG,
+    HighLevelPortfolioEnv as HLEnvCG,
+    PortfolioCore as PortfolioCoreCG,
+    SyntheticPoolCoreSampler as SamplerCG,
+)
+
 from portfolio_stats import compute_stats
 
 
@@ -41,26 +55,54 @@ from portfolio_stats import compute_stats
 # Paths
 # ---------------------------------------------------------------------------
 
-# Frozen LL — random-HL fine-tuned (used by v2)
 LL_MODEL = (PATHS.checkpoints / "ll_random_hl_finetune"
             / "ll_random_hl_ft_final.zip")
 LL_VECNORM = (PATHS.checkpoints / "ll_random_hl_finetune"
               / "ll_random_hl_ft_final_vecnorm.pkl")
 
-HL_V2_DIR = PATHS.checkpoints / "hl_synth_pretrain_v2"
+UC_DIR = PATHS.checkpoints / "hl_finetune_real_unconstrained"
+CG_DIR = PATHS.checkpoints / "hl_finetune_real_constrained_gross"
 
-# Best on real_test in v2 was step 900000 (eval reward -2.). Best on
-# real_train was step 700000 (eval reward -4.01). Final at 1M.
-HL_V2_CHECKPOINTS = [
+# (label, model_path, vecnorm_path, env_variant)
+# env_variant in {"uc", "cg"} selects which env classes to use
+HL_FT_CHECKPOINTS = [
+    # Unconstrained fine-tune
     (
-        "hl_v2_900k_best_test",
-        HL_V2_DIR / "best_on_real_test" / "best_model.zip",
-        HL_V2_DIR / "ppo_hl_v2_vecnormalize_900000_steps.pkl",
+        "hl_ft_uc_best_test",
+        UC_DIR / "best_on_real_test" / "best_model.zip",
+        UC_DIR / "ppo_hl_ft_uc_vecnormalize_100000_steps.pkl",
+        "uc",
     ),
     (
-        "hl_v2_1M_final",
-        HL_V2_DIR / "hl_v2_final.zip",
-        HL_V2_DIR / "hl_v2_final_vecnorm.pkl",
+        "hl_ft_uc_best_train",
+        UC_DIR / "best_on_real_train" / "best_model.zip",
+        UC_DIR / "ppo_hl_ft_uc_vecnormalize_200000_steps.pkl",
+        "uc",
+    ),
+    (
+        "hl_ft_uc_final",
+        UC_DIR / "hl_ft_uc_final.zip",
+        UC_DIR / "hl_ft_uc_final_vecnorm.pkl",
+        "uc",
+    ),
+    # Constrained-gross fine-tune
+    (
+        "hl_ft_cg_best_test",
+        CG_DIR / "best_on_real_test" / "best_model.zip",
+        CG_DIR / "ppo_hl_ft_cg_vecnormalize_100000_steps.pkl",
+        "cg",
+    ),
+    (
+        "hl_ft_cg_best_train",
+        CG_DIR / "best_on_real_train" / "best_model.zip",
+        CG_DIR / "ppo_hl_ft_cg_vecnormalize_200000_steps.pkl",
+        "cg",
+    ),
+    (
+        "hl_ft_cg_final",
+        CG_DIR / "hl_ft_cg_final.zip",
+        CG_DIR / "hl_ft_cg_final_vecnorm.pkl",
+        "cg",
     ),
 ]
 
@@ -92,8 +134,6 @@ class _DummyObsEnv(gym.Env):
 
 
 def load_frozen_ll():
-    """Load random-HL LL. NO Fix A patch (LL trained with random HL, stats
-    are already meaningful)."""
     ll_model = PPO.load(str(LL_MODEL), device="cpu")
     dummy_env = DummyVecEnv([lambda: _DummyObsEnv(ll_model.observation_space.shape[0])])
     ll_vecnorm = VecNormalize.load(str(LL_VECNORM), dummy_env)
@@ -158,21 +198,47 @@ def run_hl_episode(hl_model, hl_vecnorm_path, env_factory):
     }
 
 
-def make_real_hl_env_factory(features, returns, ll_adapter, seed):
+# ---------------------------------------------------------------------------
+# Env factories — variant-aware (unconstrained vs constrained-gross)
+# ---------------------------------------------------------------------------
+
+def make_real_hl_env_factory(features, returns, ll_adapter, seed, variant):
+    if variant == "uc":
+        cfg_cls = CoreConfigUC
+        core_cls = PortfolioCoreUC
+        env_cls = HLEnvUC
+    elif variant == "cg":
+        cfg_cls = CoreConfigCG
+        core_cls = PortfolioCoreCG
+        env_cls = HLEnvCG
+    else:
+        raise ValueError(f"Unknown variant: {variant}")
+
     def _init():
-        cfg = CoreConfig(episode_length=REAL_EPISODE_LENGTH)
-        core = PortfolioCore(features, returns, cfg=cfg,
-                              rng=np.random.default_rng(seed))
-        return HighLevelPortfolioEnv(core, ll_adapter)
+        cfg = cfg_cls(episode_length=REAL_EPISODE_LENGTH)
+        core = core_cls(features, returns, cfg=cfg,
+                         rng=np.random.default_rng(seed))
+        return env_cls(core, ll_adapter)
     return _init
 
 
-def make_synth_hl_env_factory(pool, ll_adapter, seed):
+def make_synth_hl_env_factory(pool, ll_adapter, seed, variant):
+    if variant == "uc":
+        cfg_cls = CoreConfigUC
+        sampler_cls = SamplerUC
+        env_cls = HLEnvUC
+    elif variant == "cg":
+        cfg_cls = CoreConfigCG
+        sampler_cls = SamplerCG
+        env_cls = HLEnvCG
+    else:
+        raise ValueError(f"Unknown variant: {variant}")
+
     def _init():
-        cfg = CoreConfig(episode_length=SYNTH_EPISODE_LENGTH)
-        sampler = SyntheticPoolCoreSampler(pool=pool, cfg=cfg,
-                                            rng=np.random.default_rng(seed))
-        return HighLevelPortfolioEnv(sampler, ll_adapter)
+        cfg = cfg_cls(episode_length=SYNTH_EPISODE_LENGTH)
+        sampler = sampler_cls(pool=pool, cfg=cfg,
+                                rng=np.random.default_rng(seed))
+        return env_cls(sampler, ll_adapter)
     return _init
 
 
@@ -187,8 +253,8 @@ def aggregate(per_seed):
 
 def print_header():
     cols = ["eq", "alpha", "sharpe", "sortino", "calmar", "max_dd", "hit", "reward"]
-    print(f"  {'label @ dataset':<32s}" + "".join(f"  {c:>7s}" for c in cols))
-    print("  " + "-" * 32 + "".join(f"  {'-'*7}" for _ in cols))
+    print(f"  {'label @ dataset':<36s}" + "".join(f"  {c:>7s}" for c in cols))
+    print("  " + "-" * 36 + "".join(f"  {'-'*7}" for _ in cols))
 
 
 def print_row(label, m):
@@ -202,7 +268,7 @@ def print_row(label, m):
         ("hit_rate",     7, 3, ""),
         ("total_reward", 7, 1, "+"),
     ]
-    s = f"  {label:<32s}"
+    s = f"  {label:<36s}"
     for key, w, d, sign in cols:
         s += f"  {m[key]:>{sign}{w}.{d}f}"
     print(s)
@@ -213,25 +279,36 @@ def print_row(label, m):
 # ---------------------------------------------------------------------------
 
 def main():
-    print("=" * 88)
-    print("HL v2 evaluation (frozen LL = ll_random_hl_finetune)")
-    print("=" * 88)
+    print("=" * 96)
+    print("HL real-data fine-tune evaluation")
+    print("=" * 96)
+    print()
+    print("Two fine-tune runs:")
+    print("  uc = unconstrained gross  (started from hl_v2_final.zip)")
+    print("  cg = constrained gross    (started from hl_v2_cg_final.zip)")
+    print()
+    print("Both fine-tuned 200k steps on real_train data with:")
+    print("  lr=3e-5, clip_range=0.05, ent_coef=0.01, n_epochs=4")
+    print()
 
     # Verify
-    print("\nVerifying checkpoint files...")
-    for label, model_p, vecnorm_p in HL_V2_CHECKPOINTS:
+    print("Verifying checkpoint files...")
+    valid = []
+    for label, model_p, vecnorm_p, variant in HL_FT_CHECKPOINTS:
         m_ok = model_p.exists()
         v_ok = vecnorm_p.exists()
         flag = "OK " if (m_ok and v_ok) else "MISSING"
         print(f"  [{flag}] {label}")
         if not m_ok: print(f"          model:    {model_p}")
         if not v_ok: print(f"          vecnorm:  {vecnorm_p}")
+        if m_ok and v_ok:
+            valid.append((label, model_p, vecnorm_p, variant))
+
     if not LL_MODEL.exists() or not LL_VECNORM.exists():
         print(f"  [MISSING] frozen LL")
         sys.exit(1)
-    valid = [c for c in HL_V2_CHECKPOINTS if c[1].exists() and c[2].exists()]
     if not valid:
-        print("\nNo valid HL v2 checkpoints. Aborting.")
+        print("\nNo valid HL fine-tune checkpoints. Aborting.")
         sys.exit(1)
 
     # Datasets
@@ -243,26 +320,29 @@ def main():
     pool = load_synthetic_pool(PATHS.synth_pool)
 
     # Frozen LL
-    print("\nLoading frozen LL (random-HL fine-tuned)...")
+    print("Loading frozen LL (random-HL fine-tuned)...")
     ll_predict_fn = load_frozen_ll()
     ll_adapter = FrozenLLAdapter(ll_predict_fn)
 
-    # Eval each HL v2 checkpoint
+    # Eval each checkpoint
     all_results = {}
-    for ckpt_label, model_path, vecnorm_path in valid:
+    for ckpt_label, model_path, vecnorm_path, variant in valid:
         print()
-        print("=" * 88)
-        print(f"HL CHECKPOINT: {ckpt_label}")
+        print("=" * 96)
+        print(f"HL CHECKPOINT: {ckpt_label}  (variant={variant})")
         print(f"  model:   {model_path.name}")
         print(f"  vecnorm: {vecnorm_path.name}")
-        print("=" * 88)
+        print("=" * 96)
 
         hl_model = PPO.load(str(model_path), device="cpu")
         ds_results = {}
         for ds_name, factory_builder in [
-            ("real_train", lambda s: make_real_hl_env_factory(feats_train, rets_train, ll_adapter, s)),
-            ("real_test",  lambda s: make_real_hl_env_factory(feats_test, rets_test, ll_adapter, s)),
-            ("synth",      lambda s: make_synth_hl_env_factory(pool, ll_adapter, s + 9000)),
+            ("real_train",
+             lambda s: make_real_hl_env_factory(feats_train, rets_train, ll_adapter, s, variant)),
+            ("real_test",
+             lambda s: make_real_hl_env_factory(feats_test, rets_test, ll_adapter, s, variant)),
+            ("synth",
+             lambda s: make_synth_hl_env_factory(pool, ll_adapter, s + 9000, variant)),
         ]:
             per_seed = []
             for seed in range(N_SEEDS):
@@ -277,25 +357,40 @@ def main():
 
     # Headline real_test
     print()
-    print("=" * 88)
-    print("HEADLINE: real_test — HL v2 vs HL v1 vs LL-only baselines vs random")
-    print("=" * 88)
+    print("=" * 96)
+    print("HEADLINE: real_test — HL fine-tunes vs full leaderboard")
+    print("=" * 96)
     print()
     print("Reference numbers (from previous evals):")
-    print("  random              @ real_test   eq=1.124  alpha=-0.577  sharpe=+0.45  max_dd=0.232")
-    print("  synth_600k_LL       @ real_test   eq=1.434  alpha=-0.263  sharpe=+1.61  max_dd=0.110")
-    print("  light_100k_LL       @ real_test   eq=1.531  alpha=-0.172  sharpe=+1.87  max_dd=0.112")
-    print("  hl_v1_300k_best_test@ real_test   eq=1.223  alpha=-0.478  sharpe=+1.60  max_dd=0.053")
-    print("  hl_v1_1M_final      @ real_test   eq=1.059  alpha=-0.650  sharpe=+0.35  max_dd=0.097")
+    print(f"  {'random':<32s}  eq=1.124  alpha=-0.577  sharpe=+0.45  max_dd=0.232")
+    print(f"  {'synth_600k_LL':<32s}  eq=1.434  alpha=-0.263  sharpe=+1.61  max_dd=0.110")
+    print(f"  {'light_100k_LL (best baseline)':<32s}  eq=1.531  alpha=-0.172  sharpe=+1.87  max_dd=0.112")
+    print(f"  {'hl_v1_300k_best_test':<32s}  eq=1.223  alpha=-0.478  sharpe=+1.60  max_dd=0.053")
+    print(f"  {'hl_v2_250k_best_test (HL=0.03)':<32s}  eq=1.095  alpha=-0.600  sharpe=+0.46  max_dd=0.103")
+    print(f"  {'hl_v2_cg_250k_best_test':<32s}  eq=1.084  alpha=-0.612  sharpe=+0.32  max_dd=0.338")
     print()
     print_header()
     for ckpt_label, ds_results in all_results.items():
         print_row(f"{ckpt_label} @ real_test", ds_results["real_test"])
 
+    # Train-test gap analysis
     print()
-    print("=" * 88)
+    print("=" * 96)
+    print("TRAIN-TEST GAP ANALYSIS")
+    print("=" * 96)
+    print()
+    print(f"  {'checkpoint':<32s}  {'train_eq':>10s}  {'test_eq':>10s}  {'gap':>10s}")
+    print(f"  {'-'*32}  {'-'*10}  {'-'*10}  {'-'*10}")
+    for ckpt_label, ds_results in all_results.items():
+        train_eq = ds_results["real_train"]["final_equity"]
+        test_eq = ds_results["real_test"]["final_equity"]
+        gap = train_eq - test_eq
+        print(f"  {ckpt_label:<32s}  {train_eq:>10.3f}  {test_eq:>10.3f}  {gap:>+10.3f}")
+
+    print()
+    print("=" * 96)
     print("Done.")
-    print("=" * 88)
+    print("=" * 96)
 
 
 if __name__ == "__main__":
